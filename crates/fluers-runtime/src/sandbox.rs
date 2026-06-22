@@ -3,16 +3,18 @@
 //! A [`Sandbox`] manufactures a fresh [`SessionEnv`](crate::SessionEnv) for a
 //! session. Flue ships three flavours — *virtual*, *local*, and *remote
 //! container* — selected via `local()` / container providers. This crate
-//! implements the local flavour; virtual + remote are stubbed for later
-//! phases (see `PORTING_PLAN.md`).
+//! implements the local flavour (see [`LocalSessionEnv`]); virtual + remote
+//! are stubbed for later phases (see `PORTING_PLAN.md`).
+//!
+//! [`LocalSessionEnv`]: crate::LocalSessionEnv
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::env::{Limits, SessionEnv, ShellResult};
-use crate::error::{RuntimeError, RuntimeResult};
-use tokio_util::sync::CancellationToken;
+use crate::env::{Limits, SessionEnv};
+use crate::error::RuntimeResult;
+use crate::local_env::LocalSessionEnv;
 
 /// A factory that produces a [`SessionEnv`] for one session.
 #[async_trait]
@@ -58,12 +60,11 @@ impl Sandbox for LocalSandbox {
     }
 
     async fn env_for(&self, _workdir: &Path) -> RuntimeResult<Arc<dyn SessionEnv>> {
-        // The full local SessionEnv (tokio::process + real fs ops) lands in
-        // MVP 0. For now we return a stub so the trait graph compiles.
-        Ok(Arc::new(StubEnv {
-            root: self.root.clone(),
-            limits: self.limits,
-        }))
+        // The sandbox's configured root is the session root; the `workdir`
+        // override is honored by direct `LocalSessionEnv::new` callers.
+        Ok(Arc::new(
+            LocalSessionEnv::new(&self.root, self.limits).await?,
+        ))
     }
 }
 
@@ -71,57 +72,4 @@ impl Sandbox for LocalSandbox {
 #[must_use]
 pub fn local() -> LocalSandbox {
     LocalSandbox::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-/// Placeholder environment. Real fs/exec impl arrives in MVP 0.
-struct StubEnv {
-    #[allow(dead_code)]
-    root: PathBuf,
-    #[allow(dead_code)]
-    limits: Limits,
-}
-
-#[async_trait]
-impl SessionEnv for StubEnv {
-    async fn read_file(
-        &self,
-        _path: &Path,
-        _max_lines: usize,
-        _max_bytes: usize,
-    ) -> RuntimeResult<String> {
-        Err(RuntimeError::Sandbox(
-            "local SessionEnv not yet implemented (see PORTING_PLAN.md MVP 0)".into(),
-        ))
-    }
-
-    async fn write_file(&self, _path: &Path, _content: &str) -> RuntimeResult<()> {
-        Err(RuntimeError::Sandbox(
-            "local SessionEnv not yet implemented (see PORTING_PLAN.md MVP 0)".into(),
-        ))
-    }
-
-    async fn exec(
-        &self,
-        _command: &str,
-        _cwd: &Path,
-        _timeout_ms: Option<u64>,
-        _cancel: &CancellationToken,
-    ) -> RuntimeResult<ShellResult> {
-        Err(RuntimeError::Sandbox(
-            "local SessionEnv not yet implemented (see PORTING_PLAN.md MVP 0)".into(),
-        ))
-    }
-
-    async fn glob(&self, _pattern: &str, _limit: usize) -> RuntimeResult<Vec<String>> {
-        Ok(Vec::new())
-    }
-
-    async fn grep(
-        &self,
-        _pattern: &str,
-        _paths: &[&str],
-        _max_matches: usize,
-    ) -> RuntimeResult<Vec<String>> {
-        Ok(Vec::new())
-    }
 }

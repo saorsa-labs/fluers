@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fluers-core",
     "crates/fluers-runtime",
+    "crates/fluers-providers",
     "crates/fluers-cli",
     "crates/fluers-sdk",
     "crates/fluers-mcp",
@@ -89,6 +90,7 @@ parking_lot = "0.12"
 # Internal crates
 fluers-core = { path = "crates/fluers-core", version = "0.1.0" }
 fluers-runtime = { path = "crates/fluers-runtime", version = "0.1.0" }
+fluers-providers = { path = "crates/fluers-providers", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

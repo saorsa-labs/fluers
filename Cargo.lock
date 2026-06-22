@@ -272,9 +272,11 @@ dependencies = [
  "anyhow",
  "clap",
  "fluers-core",
+ "fluers-providers",
  "fluers-runtime",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -331,6 +333,20 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "fluers-providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fluers-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

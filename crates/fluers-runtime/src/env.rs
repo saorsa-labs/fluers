@@ -16,8 +16,10 @@ use crate::error::RuntimeResult;
 pub struct ShellResult {
     /// Exit code (124 conventionally denotes a timeout, as in Flue).
     pub exit_code: i32,
-    /// Combined stdout/stderr (MVP; Flue separates them).
-    pub output: String,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
 }
 
 /// The environment a session runs in.
