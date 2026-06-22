@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{CoreError, Result};
 
@@ -29,8 +29,9 @@ pub struct ParameterSchema {
 pub struct InvokeContext {
     /// The unique id of this invocation's tool call.
     pub tool_call_id: String,
-    /// A cancellation token. Signal it to abort long-running work.
-    pub cancel: std::sync::Arc<Notify>,
+    /// Cooperative + deadline cancellation. Tools should `select!` on
+    /// `cancel.cancelled()` for long-running work. Clonable and `'static`.
+    pub cancel: CancellationToken,
 }
 
 /// A tool call extracted from a model response.

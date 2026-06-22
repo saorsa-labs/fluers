@@ -123,6 +123,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Add a skill.
+    pub fn skill(&mut self, skill: Arc<Skill>) -> &mut Self {
+        self.skills.push(skill);
+        self
+    }
+
     /// Set the sandbox.
     pub fn sandbox(&mut self, sandbox: Arc<dyn Sandbox>) -> &mut Self {
         self.sandbox = Some(sandbox);

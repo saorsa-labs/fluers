@@ -20,9 +20,13 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Test code may use unwrap/expect/panic for clarity (project policy).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod error;
 pub mod message;
+#[cfg(test)]
+mod message_tests;
 pub mod model;
 pub mod thinking;
 pub mod tool;

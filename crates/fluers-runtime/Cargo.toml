@@ -22,3 +22,7 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

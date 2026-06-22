@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::RuntimeResult;
 
@@ -37,12 +38,16 @@ pub trait SessionEnv: Send + Sync {
     async fn write_file(&self, path: &Path, content: &str) -> RuntimeResult<()>;
 
     /// Run a shell command, with a `timeout_ms` hint and cancellation.
+    ///
+    /// Implementations should `select!` on `cancel.cancelled()` and, for
+    /// child processes, send `SIGTERM` (then `SIGKILL` after a grace
+    /// period) on cancel.
     async fn exec(
         &self,
         command: &str,
         cwd: &Path,
         timeout_ms: Option<u64>,
-        cancel: &tokio::sync::Notify,
+        cancel: &CancellationToken,
     ) -> RuntimeResult<ShellResult>;
 
     /// List files matching a glob (bounded by `limit`).
@@ -90,9 +95,4 @@ impl Default for Limits {
 /// Read an entire file ignoring the caps (used by internal helpers).
 pub async fn read_all(env: &dyn SessionEnv, path: &Path) -> RuntimeResult<String> {
     env.read_file(path, usize::MAX, usize::MAX).await
-}
-
-#[allow(dead_code)]
-async fn _unused(_p: &Path) -> RuntimeResult<()> {
-    Ok(())
 }

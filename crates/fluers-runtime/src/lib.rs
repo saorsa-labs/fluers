@@ -17,20 +17,26 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Test code may use unwrap/expect/panic for clarity (project policy).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent;
 pub mod env;
 pub mod error;
 pub mod event;
+pub mod persistence;
 pub mod sandbox;
 pub mod session;
 pub mod skill;
+#[cfg(test)]
+mod skill_tests;
 pub mod tool;
 
 pub use agent::{define_agent, Agent, AgentProfile, AgentSpec};
 pub use env::SessionEnv;
 pub use error::{RuntimeError, RuntimeResult};
 pub use event::{Event, EventSubscriber};
+pub use persistence::PersistenceAdapter;
 pub use sandbox::{local, Sandbox};
 pub use skill::Skill;
 pub use tool::builtin_tools;

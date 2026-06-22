@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::sync::Notify;
 
+use fluers_core::error::CoreError;
 use fluers_core::tool::{
     validate_input, InvokeContext, JsonValue, ParameterSchema, Tool, ToolDefinition, ToolResult,
 };
@@ -32,10 +32,13 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
 }
 
 /// A thin tool wrapper that delegates execution to a closure over the env.
+///
+/// `run` returns a `Result` so errors propagate as tool failures rather than
+/// being stringified into "successful" output.
 struct EnvTool {
     def: ToolDefinition,
     #[allow(clippy::type_complexity)]
-    run: Arc<dyn Fn(&JsonValue) -> String + Send + Sync>,
+    run: Arc<dyn Fn(&JsonValue) -> Result<String> + Send + Sync>,
 }
 
 #[async_trait]
@@ -46,10 +49,16 @@ impl Tool for EnvTool {
 
     async fn execute(&self, ctx: InvokeContext, input: JsonValue) -> Result<ToolResult> {
         validate_input(&self.def, &input)?;
-        // Best-effort cooperative cancellation: check once before running.
-        // Full per-tool cancel wiring arrives with the local SessionEnv.
-        let _ = &ctx.cancel;
-        let text = (self.run)(&input);
+        // Cooperative cancellation: surface a cancelled error if the token has
+        // already fired before we start. Full `select!` wiring arrives with
+        // the real SessionEnv in MVP 0.
+        if ctx.cancel.is_cancelled() {
+            return Err(CoreError::Cancelled(format!(
+                "tool `{}` cancelled",
+                self.def.name
+            )));
+        }
+        let text = (self.run)(&input)?;
         Ok(ToolResult {
             content: vec![json!({ "type": "text", "text": text })],
             details: None,
@@ -74,7 +83,9 @@ pub fn builtin_tools(_env: Arc<dyn SessionEnv>) -> Vec<Arc<dyn Tool>> {
                 parameters: ParameterSchema::default(),
             },
             run: Arc::new(move |input| {
-                format!("`{owned_name}` stub — input was {input} (see PORTING_PLAN.md MVP 0)")
+                Ok(format!(
+                    "`{owned_name}` stub — input was {input} (see PORTING_PLAN.md MVP 0)"
+                ))
             }),
         })
     };
@@ -87,8 +98,3 @@ pub fn builtin_tools(_env: Arc<dyn SessionEnv>) -> Vec<Arc<dyn Tool>> {
         mk("glob", "Glob", "List files matching a pattern."),
     ]
 }
-
-// Keep the Notify import used in signatures reachable for future wiring.
-const _: fn() = || {
-    fn _t(_n: &Notify) {}
-};

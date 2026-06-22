@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::env::{Limits, SessionEnv, ShellResult};
 use crate::error::{RuntimeError, RuntimeResult};
+use tokio_util::sync::CancellationToken;
 
 /// A factory that produces a [`SessionEnv`] for one session.
 #[async_trait]
@@ -104,7 +105,7 @@ impl SessionEnv for StubEnv {
         _command: &str,
         _cwd: &Path,
         _timeout_ms: Option<u64>,
-        _cancel: &tokio::sync::Notify,
+        _cancel: &CancellationToken,
     ) -> RuntimeResult<ShellResult> {
         Err(RuntimeError::Sandbox(
             "local SessionEnv not yet implemented (see PORTING_PLAN.md MVP 0)".into(),

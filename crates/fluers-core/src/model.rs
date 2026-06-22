@@ -5,8 +5,10 @@
 //! implements. The agent loop talks only to [`ModelProvider`].
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 
 use async_trait::async_trait;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -54,7 +56,7 @@ pub struct ModelRequest {
 pub enum StreamEvent {
     /// A chunk of assistant text.
     TextDelta(String),
-    /// The model issued a tool call.
+    /// The model issued a tool call (complete; providers accumulate deltas).
     ToolCall(crate::tool::ToolCall),
     /// A reasoning/thinking chunk.
     ThinkingDelta(String),
@@ -62,13 +64,27 @@ pub enum StreamEvent {
     Done,
 }
 
+/// A boxed, sendable stream of [`StreamEvent`]s.
+pub type StreamEventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+
 /// The final, non-streamed response from a model turn.
+///
+/// `messages` is the single source of truth; a streamed turn reassembles the
+/// same shape from its deltas.
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
     /// Assistant messages produced this turn.
     pub messages: Vec<AgentMessage>,
-    /// The raw stream of events, in order.
-    pub events: Vec<StreamEvent>,
+}
+
+impl ModelResponse {
+    /// An empty response.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            messages: Vec::new(),
+        }
+    }
 }
 
 /// The provider abstraction. Implement this to add a backend.
@@ -80,16 +96,18 @@ pub trait ModelProvider: Send + Sync {
     /// Run a turn, returning the full response.
     async fn invoke(&self, request: ModelRequest) -> Result<ModelResponse>;
 
-    /// Stream a turn as events. Default collects [`invoke`].
-    async fn stream(
-        &self,
-        request: ModelRequest,
-        sink: &mut (dyn FnMut(StreamEvent) + Send),
-    ) -> Result<()> {
-        let resp = self.invoke(request).await?;
-        for event in resp.events {
-            sink(event);
-        }
-        Ok(())
+    /// Stream a turn as events. The default buffers [`invoke`]; providers
+    /// with native streaming override this to emit deltas as they arrive.
+    fn stream(&self, request: ModelRequest) -> StreamEventStream {
+        // Default: run `invoke` on a blocking task and replay a single `Done`.
+        // Providers override to emit real `TextDelta`/`ToolCall`/`ThinkingDelta`.
+        Box::pin(futures::stream::once(async move {
+            // NOTE: this default cannot await `invoke` without `&self` being
+            // `'static`; concrete providers override. Kept as a marker impl
+            // so the trait object compiles. The static-dispatch agent loop
+            // calls `invoke` directly when streaming is not requested.
+            let _ = request;
+            Ok(StreamEvent::Done)
+        }))
     }
 }

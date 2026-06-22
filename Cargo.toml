@@ -46,7 +46,14 @@ toml = "0.8"
 
 # Schema / validation
 schemars = "1"
-# valibot equivalent in Flue; Rust uses serde + custom validation.
+# Full JSON-Schema validation (used once tool schemas exceed required-only checks).
+jsonschema = "0.22"
+
+# Cancellation / async utilities
+tokio-util = "0.7"
+
+# Base64 for image attachments (replaces hand-rolled codec).
+base64 = "0.22"
 
 # Error handling
 thiserror = "2"
@@ -72,6 +79,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 nix = { version = "0.29", features = ["signal", "process"] }
 
 # Utilities
+proptest = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"

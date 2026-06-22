@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tool::ToolCall;
-
 /// Who authored a message in the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,62 +65,21 @@ pub struct ImageContent {
     pub data: Vec<u8>,
 }
 
+/// Base64 (de)serialization for [`ImageContent::data`], backed by the
+/// audited `base64` crate rather than a hand-rolled codec.
 mod serde_base64 {
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        use base64_encode as enc;
-        enc(v).serialize(s)
+        STANDARD.encode(v).serialize(s)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        base64_decode(&s).map_err(serde::de::Error::custom)
-    }
-
-    fn base64_encode(v: &[u8]) -> String {
-        const TBL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(v.len().div_ceil(3) * 4);
-        for chunk in v.chunks(3) {
-            let b0 = chunk[0];
-            let b1 = *chunk.get(1).unwrap_or(&0);
-            let b2 = *chunk.get(2).unwrap_or(&0);
-            let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-            out.push(TBL[((n >> 18) & 63) as usize] as char);
-            out.push(TBL[((n >> 12) & 63) as usize] as char);
-            if chunk.len() > 1 {
-                out.push(TBL[((n >> 6) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-            if chunk.len() > 2 {
-                out.push(TBL[(n & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-        out
-    }
-
-    fn base64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
-        const TBL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = Vec::with_capacity(s.len() * 3 / 4);
-        let mut buf: u32 = 0;
-        let mut bits = 0;
-        for c in s.bytes() {
-            if c == b'=' {
-                break;
-            }
-            let val = TBL.iter().position(|&t| t == c).ok_or("invalid base64")? as u32;
-            buf = (buf << 6) | val;
-            bits += 6;
-            if bits >= 8 {
-                bits -= 8;
-                out.push((buf >> bits) as u8);
-                buf &= (1 << bits) - 1;
-            }
-        }
-        Ok(out)
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 

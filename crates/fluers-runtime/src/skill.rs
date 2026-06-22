@@ -62,7 +62,7 @@ impl Skill {
 }
 
 /// Split `---\nkey: val\n---\nbody` into `(frontmatter pairs, body)`.
-fn split_frontmatter(raw: &str) -> (Vec<(String, String)>, &str) {
+pub(crate) fn split_frontmatter(raw: &str) -> (Vec<(String, String)>, &str) {
     let raw = raw.strip_prefix("---\n").unwrap_or(raw);
     let Some(end) = raw.find("\n---\n") else {
         return (Vec::new(), raw);
