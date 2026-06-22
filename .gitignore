@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build artifacts
+/dist
+/build
+/.build
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime state
+.flue/
+fluers-data/

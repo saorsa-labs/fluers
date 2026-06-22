@@ -1,0 +1,24 @@
+[package]
+name = "fluers-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The Fluers agent harness: agent definition, sessions, skills, sandbox, events"
+
+[lints]
+workspace = true
+
+[dependencies]
+fluers-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true

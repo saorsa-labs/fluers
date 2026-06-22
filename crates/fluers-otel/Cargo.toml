@@ -1,0 +1,18 @@
+[package]
+name = "fluers-otel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OpenTelemetry tracing adapter for Fluers"
+
+[lints]
+workspace = true
+
+[dependencies]
+fluers-runtime.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

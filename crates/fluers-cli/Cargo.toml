@@ -1,0 +1,26 @@
+[package]
+name = "fluers-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The `fluers` CLI: build/dev/deploy tooling for Fluers agents"
+
+[[bin]]
+name = "fluers"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+fluers-core.workspace = true
+fluers-runtime.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
