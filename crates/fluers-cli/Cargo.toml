@@ -19,6 +19,7 @@ workspace = true
 fluers-core.workspace = true
 fluers-runtime.workspace = true
 fluers-providers.workspace = true
+uuid.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

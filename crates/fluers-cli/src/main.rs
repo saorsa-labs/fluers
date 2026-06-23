@@ -24,7 +24,7 @@ enum Command {
     /// Show version and crate layout info.
     Version,
     /// Run an agent locally (MVP: prints the resolved profile).
-    Run(commands::RunArgs),
+    Run(Box<commands::RunArgs>),
     /// Start the dev server (stub).
     Dev(commands::DevArgs),
     /// Build agents for deployment (stub).
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Version => commands::version(),
-        Command::Run(args) => commands::run(args).await,
+        Command::Run(args) => commands::run(*args).await,
         Command::Dev(args) => commands::dev(args).await,
         Command::Build => commands::build(),
         Command::Deploy(args) => commands::deploy(args).await,

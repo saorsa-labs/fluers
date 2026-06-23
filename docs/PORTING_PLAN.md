@@ -143,23 +143,24 @@ enforcement, streaming, and cancellation working. ✅ **Met (live-verified)**.
 >    frontmatter schema + injection (greenfield), EventBus → bounded-channel
 >    rewrite (ripples to `fluers-otel`).
 
-- [ ] **Per-turn `TurnSink` seam** in `fluers-core` (`run_agent` +
+- [x] **Per-turn `TurnSink` seam** in `fluers-core` (`run_agent` +
       `run_agent_streaming`)
-- [ ] Typed `SessionState` envelope (`schema_version` + resume fields)
-- [ ] `SessionStore`: sync in-memory + `async save/load` over the adapter +
+- [x] Typed `SessionState` envelope (`schema_version` + resume fields)
+- [x] `SessionStore`: sync in-memory + `async save/load` over the adapter +
       `list_sessions`
-- [ ] **JSON-file persistence adapter** (`JsonFileAdapter`) so "resume after
+- [x] **JSON-file persistence adapter** (`JsonFileAdapter`) so "resume after
       kill" works without Postgres (MVP 4)
-- [ ] `SessionRunner` coordinator in `fluers-runtime` wiring sink → persist
-- [ ] CLI `--session <id>`: create+print on new, load+resume on existing
-- [ ] Resumable sessions integration test (create → run → persist → reload →
-      continue)
+- [x] `SessionRunner` coordinator in `fluers-runtime` wiring sink → persist
+- [x] CLI `--session <id>`: create+print on new, load+resume on existing;
+      `--sessions-dir`, `--list-sessions`
+- [x] Resumable sessions verified live (text + tool sessions both resume
+      with full context)
 - [ ] Full `SKILL.md` frontmatter schema + injection *(deferred — greenfield)*
-- [ ] Event stream: bounded-channel `EventBus` rewrite *(deferred — ripples
-      to `fluers-otel`)*
+- [ ] Event stream: bounded-channel `EventBus` *(done — deadlock-free
+      broadcast channel; event wiring into the loop deferred to MVP 3)*
 
 **Exit criteria:** start a session, run several turns, kill the process,
-resume from the JSON-file persisted state.
+resume from the JSON-file persisted state. ✅ **Met (live-verified)**.
 
 ---
 
