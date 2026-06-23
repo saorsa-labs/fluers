@@ -2,6 +2,11 @@
 
 **A native Rust port of [Flue](https://github.com/withastro/flue) — the agent harness framework.**
 
+> 🙏 **Credit:** Flue was created by [**Fred K. Schott**](https://github.com/FredKSchott) and the
+> [Astro](https://astro.build) team. Fluers is an independent Rust reimplementation of their
+> architecture — this project wouldn't exist without their excellent original work. See
+> [`NOTICE`](NOTICE) for the full attribution.
+>
 > Status: 🚧 **Scaffolded.** Crate graph, trait foundations, and CLI compile and run.
 > Behavior is intentionally stubbed behind a phased MVP plan — see
 > [`docs/PORTING_PLAN.md`](docs/PORTING_PLAN.md).
@@ -80,10 +85,26 @@ milestone breakdown (MVP 0 → MVP 4).
 
 ## Attribution
 
-Fluers is a derivative work inspired by and architecturally modeled on
-[Flue](https://github.com/withastro/flue) by Astro. Upstream is licensed
-Apache-2.0; Fluers is likewise Apache-2.0.
+Fluers is a native Rust reimplementation of the architecture of
+[**Flue — The Sandbox Agent Framework**](https://github.com/withastro/flue),
+created by **[Fred K. Schott](https://github.com/FredKSchott)** and the
+[Astro](https://astro.build) team.
+
+**All design credit for the agent-harness architecture belongs to Fred and
+the Astro contributors.** Fluers is an independent Rust implementation of
+those ideas, not a line-by-line translation of the TypeScript source; this
+project would not exist without their excellent original work. See
+[`NOTICE`](NOTICE) for the full derivative-work notice.
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+Dual-licensed under either
+
+- the Apache License, Version 2.0
+  ([`LICENSE-APACHE`](LICENSE-APACHE)), or
+- the MIT License ([`LICENSE-MIT`](LICENSE-MIT))
+
+at your option (`SPDX-License-Identifier: MIT OR Apache-2.0`). Upstream
+Flue is licensed Apache-2.0.
+
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/saorsa-labs/fluers#license)

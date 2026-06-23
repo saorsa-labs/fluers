@@ -1,16 +1,27 @@
 Fluers
 ======
 
-Fluers is a native Rust port of the architecture of Flue
-(https://github.com/withastro/flue), an agent harness framework by the
-Astro team, licensed under the Apache License, Version 2.0.
+Fluers is a native Rust reimplementation of the architecture of **Flue —
+The Sandbox Agent Framework** (https://github.com/withastro/flue).
+
+This project exists thanks to the excellent design work of the original
+Flue author, **Fred K. Schott** (https://github.com/FredKSchott), and the
+Astro team (https://astro.build) and its contributors. Fluers is an
+independent Rust implementation of that architecture; all design credit
+for the agent-harness model belongs to them.
+
+
+What Fluers re-implements
+-------------------------
 
 Fluers re-implements Flue's architectural concepts from first principles
-in Rust. It is not a line-by-line translation of the TypeScript source:
-the harness layer (`@flue/runtime`) is re-expressed as `fluers-runtime`,
-and the two foundational libraries Flue depends on
-(`@earendil-works/pi-agent-core` and `@earendil-works/pi-ai`, which have
-no Rust equivalent) are re-implemented as `fluers-core`.
+in Rust. It is **not** a line-by-line translation of the TypeScript
+source:
+
+  - The harness layer (`@flue/runtime`) is re-expressed as `fluers-runtime`.
+  - The two foundational libraries Flue depends on —
+    `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai`, which
+    have no published Rust crate — are re-implemented as `fluers-core`.
 
 Per the Apache-2.0 license (Section 4d), derivative works must preserve
 attribution. Source files that port specific behavior from a named Flue
@@ -18,17 +29,33 @@ file carry a doc comment citing the upstream path, e.g.:
 
     //! Mirrors Flue's `packages/runtime/src/agent.ts`.
 
+
 Upstream copyright and license
 ------------------------------
 
-    Flue — The Agent Harness Framework
-    Copyright (c) WithAstro / individual contributors
-    Licensed under the Apache License, Version 2.0
+    Flue — The Sandbox Agent Framework
     https://github.com/withastro/flue
 
-This product (Fluers) is © 2026 Saorsa Labs and is also licensed under
-the Apache License, Version 2.0. See LICENSE for the full text.
+    Original author : Fred K. Schott
+    Copyright (c) Astro and individual contributors
+    Licensed under the Apache License, Version 2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
-"Flue" is a project name belonging to its authors. "Fluers" is a
-distinct project and does not imply endorsement by or affiliation with
-the Flue authors or Astro.
+
+Fluers license
+--------------
+
+Fluers is © 2026 Saorsa Labs and is dual-licensed, at your option, under:
+
+  - the Apache License, Version 2.0 (see LICENSE-APACHE), or
+  - the MIT License (see LICENSE-MIT).
+
+See the root `LICENSE` file for the SPDX expression and a short summary.
+
+
+Trademarks
+----------
+
+"Flue" is a project name belonging to its authors. "Fluers" is a distinct
+project and does not imply endorsement by or affiliation with Fred K.
+Schott, the Flue authors, or Astro.
