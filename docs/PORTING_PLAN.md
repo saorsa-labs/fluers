@@ -236,6 +236,11 @@ image.
 remote container, persists sessions to Postgres for resume, recalls user
 preferences via mem0, and emits OTel traces.
 
+> **See [`MVP4_PLAN.md`](MVP4_PLAN.md) for the slice-by-slice execution plan
+> (4a Postgres → 4b mem0 → 4c OTel → 4d MCP → 4e sandbox → 4f subagents).**
+> MVP 4 is split into independently shippable slices; 4a (Postgres) lands
+> first.
+
 ---
 
 ## Cross-cutting: what carries through every phase
