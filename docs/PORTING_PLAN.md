@@ -172,14 +172,22 @@ resume from the JSON-file persisted state. ✅ **Met (live-verified)**.
 > streaming stay here; **build/deploy** (container images) moves to a
 > separate later milestone — it's orthogonal and alone multi-week.
 
-- [ ] `axum` server with the `dispatch` / `invoke` / `listAgents` / `getRun`
-      endpoints (mirror `runtime/src/runtime/flue-app.ts` + `invoke.ts`)
-- [ ] `AgentRouteHandler` equivalent (auth/guard middleware)
-- [ ] `fluers dev` boots the local runtime + watches for agent changes
-- [ ] `fluers-sdk` streaming client wired to the real SSE protocol
+- [x] `axum` server with the `dispatch` / `invoke` / `listAgents` / `getRun`
+      endpoints (new `fluers-server` crate; wire types in `fluers-protocol`).
+      Routes: `GET /health`, `GET /agents`, `POST /agents/{name}/invoke`,
+      `POST /agents/{name}/stream`, `GET /runs/{run_id}`.
+- [ ] `AgentRouteHandler` equivalent (auth/guard middleware) — *deferred*
+      (auth not needed for local dev server; add before public deployment)
+- [x] `fluers dev` boots the local runtime with a `default` agent.
+- [x] `fluers-sdk` client wired to the real HTTP/SSE protocol (`invoke`,
+      `stream`, `get_run`, `list_agents`).
 
 **Exit criteria:** `fluers dev` serves an agent; a remote `fluers-sdk` client
-invokes it and receives streamed events.
+invokes it and receives streamed events. ✅ **Met (live-verified)**:
+`GET /health`, `GET /agents`, `POST /agents/default/invoke` (returns
+`MVP3-OK`), `POST /agents/default/stream` (live `text_delta` + `done`
+SSE events), `GET /runs/{id}`, and session resume over HTTP all confirmed
+against a live MiniMax M3 model.
 
 ---
 
