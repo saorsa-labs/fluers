@@ -95,8 +95,13 @@ pub(crate) struct DevArgs {
     #[arg(long)]
     pub workdir: Option<PathBuf>,
     /// Directory for JSON session files (default: `~/.fluers/sessions`).
+    /// Ignored when `--database-url` is set.
     #[arg(long)]
     pub sessions_dir: Option<PathBuf>,
+    /// Postgres connection URL for session persistence. When set, dev-server
+    /// sessions are persisted to Postgres instead of JSON files.
+    #[arg(long)]
+    pub database_url: Option<String>,
     /// Disable all tools (text-only agent).
     #[arg(long, default_value_t = false)]
     pub no_tools: bool,
@@ -419,12 +424,20 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
     } else {
         fluers_runtime::mvp_tools(env.clone())
     };
-    let sessions_dir = args.sessions_dir.clone().unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".fluers").join("sessions")
-    });
     let sessions: Arc<dyn fluers_runtime::PersistenceAdapter> =
-        Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir));
+        if let Some(url) = args.database_url.as_ref() {
+            Arc::new(
+                fluers_postgres::PostgresAdapter::connect(url)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?,
+            )
+        } else {
+            let sessions_dir = args.sessions_dir.clone().unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".fluers").join("sessions")
+            });
+            Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir))
+        };
     let state = Arc::new(fluers_server::ServerState::new(sessions));
     let handle = fluers_server::AgentHandle {
         provider: Arc::new(provider),
