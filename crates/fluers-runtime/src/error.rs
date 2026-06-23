@@ -20,6 +20,10 @@ pub enum RuntimeError {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
+    /// A persistence operation failed.
+    #[error("persistence error: {0}")]
+    Persistence(String),
+
     /// A tool name collided between two definitions.
     #[error("tool name conflict: {0}")]
     ToolNameConflict(String),
@@ -31,4 +35,12 @@ pub enum RuntimeError {
     /// An I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<crate::persistence::PersistenceError> for RuntimeError {
+    fn from(error: crate::persistence::PersistenceError) -> Self {
+        match error {
+            crate::persistence::PersistenceError::Backend(message) => Self::Persistence(message),
+        }
+    }
 }

@@ -10,6 +10,7 @@
 //!   process abstraction that every sandbox backend implements.
 //! - [`sandbox`] — virtual / local / remote sandbox backends.
 //! - [`session`] — session management, event store, dispatch/invoke.
+//! - [`runner`] — session-aware coordination and persistence after each turn.
 //! - [`skill`] — `SKILL.md` parsing and packaged-skill directories.
 //! - [`tool`] — the built-in tools: `read`, `write`, `edit`, `bash`, `grep`,
 //!   `glob` (with Flue's byte/line limits).
@@ -27,6 +28,7 @@ pub mod event;
 pub mod json_file_adapter;
 pub mod local_env;
 pub mod persistence;
+pub mod runner;
 pub mod sandbox;
 pub mod session;
 pub mod skill;
@@ -41,6 +43,8 @@ pub use event::{Event, EventSubscriber};
 pub use json_file_adapter::JsonFileAdapter;
 pub use local_env::LocalSessionEnv;
 pub use persistence::PersistenceAdapter;
+pub use runner::SessionRunner;
 pub use sandbox::{local, Sandbox};
+pub use session::{Session, SessionId, SessionState, SessionStore};
 pub use skill::Skill;
 pub use tool::mvp_tools;
