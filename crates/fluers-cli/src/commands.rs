@@ -207,22 +207,35 @@ pub(crate) struct DeployArgs {
 }
 
 /// Build an optional semantic-memory adapter from the memory flags. Memory is
-/// enabled only when both `--memory-url` and `--memory-user-id` are present.
-/// Returns `Ok(None)` (memory disabled) when either is missing — no error.
+/// enabled only when `--memory-url` and `--memory-user-id` are both present and
+/// non-empty (whitespace-only values are rejected). Returns `Ok(None)`
+/// (memory disabled) when either is missing — no error.
 fn build_memory_adapter(
     args: &RunArgs,
 ) -> anyhow::Result<Option<Arc<dyn fluers_memory::MemoryAdapter>>> {
-    let (Some(url), Some(user_id)) = (&args.memory_url, &args.memory_user_id) else {
-        if args.memory_url.is_some() != args.memory_user_id.is_some() {
-            eprintln!("→ memory disabled: both --memory-url and --memory-user-id are required");
+    let url = args
+        .memory_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let user_id = args
+        .memory_user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (url, user_id) {
+        (Some(url), Some(_user_id)) => {
+            let api_key = args.memory_api_key.clone().unwrap_or_default();
+            let adapter = fluers_memory::Mem0RestAdapter::new(url, api_key)
+                .map_err(|e| anyhow::anyhow!("memory adapter setup failed: {e}"))?;
+            Ok(Some(Arc::new(adapter)))
         }
-        return Ok(None);
-    };
-    let _ = user_id; // used later by the sink; adapter construction only needs url + key.
-    let api_key = args.memory_api_key.clone().unwrap_or_default();
-    let adapter = fluers_memory::Mem0RestAdapter::new(url, api_key)
-        .map_err(|e| anyhow::anyhow!("memory adapter setup failed: {e}"))?;
-    Ok(Some(Arc::new(adapter)))
+        (None, None) => Ok(None),
+        _ => {
+            eprintln!("→ memory disabled: both --memory-url and --memory-user-id are required (and non-empty)");
+            Ok(None)
+        }
+    }
 }
 
 /// Resolve a provider from the chosen backend.

@@ -227,6 +227,16 @@ fn uuid_like_id() -> String {
 ///
 /// Empty input yields an empty string (so injection is a no-op when there are
 /// no memories).
+///
+/// # Prompt-injection note
+///
+/// Memories come from a third-party store (mem0). Each memory is sanitized to
+/// a **single line** (embedded newlines are replaced with a space) so a
+/// malicious memory cannot break out of the bullet-list formatting and inject
+/// instructions that look like separate top-level directives. This is defense
+/// in depth, not a complete guarantee: treat mem0 as trusted infrastructure
+/// for your threat model, and prefer per-user isolation so one user's memories
+/// cannot influence another's.
 #[must_use]
 pub fn format_memories(memories: &[Memory]) -> String {
     if memories.is_empty() {
@@ -237,7 +247,14 @@ pub fn format_memories(memories: &[Memory]) -> String {
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
     let mut out = String::from("Relevant user memories:\n");
     for m in &sorted {
-        out.push_str(&format!("- {}\n", m.memory));
+        // Collapse any embedded newlines so a memory stays on one bullet line.
+        let one_line = m
+            .memory
+            .split('\n')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!("- {one_line}\n"));
     }
     out
 }

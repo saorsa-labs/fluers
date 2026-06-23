@@ -58,7 +58,7 @@ against the Postgres-backed store.
 
 ---
 
-### 4b — Semantic memory (mem0) — *new capability, separate from persistence*
+### 4b — Semantic memory (mem0) — *new capability, separate from persistence* — **DONE**
 
 **Crate:** `fluers-memory` (new).
 
@@ -77,6 +77,19 @@ against the Postgres-backed store.
 **Exit criteria:** an agent that recalls a user preference stated in an earlier
 session via mem0 search, while still resuming exact transcript state from the
 persistence adapter.
+
+> **Met:** `fluers-memory` crate ships `MemoryAdapter` (trait, separate from
+> `PersistenceAdapter`), `InMemoryMemoryAdapter`, `Mem0RestAdapter` (hosted
+> platform wire contract, sourced from primary sources), `MemoryTurnSink`
+> (text-pair-only, fail-open), and `FanoutTurnSink` (in `fluers-core`). CLI
+> `run` wires `--memory-url`/`--memory-user-id`/`--memory-api-key`/
+> `--memory-limit` with env fallbacks; memory injected for new sessions only.
+> 18 fluers-memory tests (incl. 6 hermetic mock-server tests), 78/78 workspace,
+> fmt + strict clippy clean. Fail-open + red-team security findings folded
+> (credential redaction on full-path URLs, prompt-injection bounding, empty-
+> user-id rejection, error-body truncation, panic/fail-open contract
+> documented). Dev-server memory wiring deferred (needs `fluers-server` to
+> accept a memory adapter in `ServerState`).
 
 ---
 

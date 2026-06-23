@@ -158,11 +158,15 @@ URL + user id are both present):
   affect the persistence sink
 - CLI flag/env parsing
 
-**HTTP adapter:**
-- Local mock HTTP server (`httpmock` or hand-rolled `hyper` listener) asserts
-  the exact request paths/headers/bodies and parses the response.
-- Live mem0 test gated behind `FLUERS_MEM0_TEST_URL`; **empty string skips**
-  (same convention as the Postgres tests).
+**HTTP adapter (mock server — no live mem0):**
+- `wiremock`-based tests assert the exact request paths/headers/bodies and
+  parse the response (`add` path + `Token` auth, `search` body with
+  query/filters/top_k, query trimming, `clear` query param, 401 handling,
+  empty-key header omission).
+- This hermetic mock-server approach superseded an earlier plan for a
+  `FLUERS_MEM0_TEST_URL`-gated live test; the mock tests are stricter and
+  require no credentials. (Live mem0 verification is a manual, pre-deploy
+  step, not part of the workspace suite.)
 
 **Full gate:** `cargo fmt --all`, strict clippy, `cargo nextest run --workspace`
 stays green without mem0/Docker/credentials.
@@ -175,3 +179,24 @@ stays green without mem0/Docker/credentials.
   replay wins).
 - Dumping tool outputs / file contents / images into mem0 — explicit non-goal.
 - mem0 outage breaking persistence or runs — explicit non-goal (fail-open).
+
+## Security & failure model (from red-team review)
+
+- **Fail-open is error-only, not panic-safe.** `MemoryTurnSink` swallows `Err`
+  from the adapter; a `panic!` inside a custom adapter would unwind through
+  `FanoutTurnSink` and abort the turn loop. The shipped adapters
+  (`Mem0RestAdapter`, `InMemoryMemoryAdapter`) are panic-free
+  (`#![forbid(unsafe_code)]`, no `unwrap`/`expect` in production code), so this
+  is safe in practice; custom adapters must uphold the same property.
+- **Prompt injection (defense in depth).** Memories come from a third-party
+  store. `format_memories` collapses each memory to a single line so a
+  malicious memory cannot break out of the bullet list to inject top-level
+  instructions. This is not a complete guarantee — treat mem0 as trusted
+  infrastructure for your threat model and use per-user isolation.
+- **Credential redaction.** Transport-error redaction scans for *any*
+  `scheme://user:pass@host` URL in the message (not just the bare base URL),
+  because reqwest errors include the full request URL. Self-hosted URLs with
+  embedded passwords are redacted before logging.
+- **Error-body bounding.** Non-2xx response bodies are truncated to 512 bytes
+  in error messages so a backend that echoes request content cannot flood logs
+  via the fail-open `warn!` path.

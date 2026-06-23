@@ -50,10 +50,16 @@ impl Mem0RestAdapter {
     /// requests to the hosted platform will then fail with a 401.
     ///
     /// # Errors
-    /// Returns [`MemoryError::Backend`] only if the HTTP client cannot be built
-    /// (e.g. a TLS-backend failure).
+    /// Returns [`MemoryError::Backend`] if the base URL is empty/whitespace or
+    /// the HTTP client cannot be built (e.g. a TLS-backend failure).
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let base_url_in = base_url.into();
+        if base_url_in.trim().is_empty() {
+            return Err(MemoryError::Backend(
+                "mem0 base URL must not be empty".into(),
+            ));
+        }
+        let base_url = base_url_in.trim_end_matches('/').to_string();
         let mut headers = HeaderMap::new();
         let api_key = api_key.into();
         // Empty key is allowed; some self-hosted setups disable auth.
@@ -160,45 +166,100 @@ async fn decode_json<T: for<'de> Deserialize<'de>>(
 }
 
 /// Build a [`MemoryError`] from a non-2xx response, without leaking the base
-/// URL (which may contain a password in self-hosted setups).
+/// URL or a large/unbounded error body. The response body is **truncated** to
+/// a small cap so a backend that echoes request content cannot flood logs via
+/// the fail-open `warn!` path.
 async fn reqwest_status_err(resp: reqwest::Response, _base_url: &str, op: &str) -> MemoryError {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    // Cap the body in the error message so logs stay bounded.
+    const BODY_CAP: usize = 512;
+    let body = if body.len() > BODY_CAP {
+        format!("{}…(truncated)", &body[..BODY_CAP])
+    } else {
+        body
+    };
     MemoryError::Backend(format!("mem0 {op} returned {status}: {body}"))
 }
 
 /// Wrap a transport error, redacting any URL embedded in the message.
-fn redact_reqwest_err(base_url: &str, e: reqwest::Error) -> MemoryError {
-    // reqwest errors can include the request URL; redact the base URL's
-    // userinfo so a password never leaks. We only redact the known base URL
-    // (not arbitrary URLs in the message) to keep this cheap.
-    let msg = e.to_string();
-    let redacted = redact_userinfo(base_url, &msg);
-    MemoryError::Backend(format!("mem0 transport: {redacted}"))
+fn redact_reqwest_err(_base_url: &str, e: reqwest::Error) -> MemoryError {
+    // reqwest errors include the **full request URL** (base + API path), not
+    // just the adapter's base URL, so we redact userinfo from any URL found in
+    // the message rather than string-replacing the bare base.
+    let msg = redact_any_url_userinfo(&e.to_string());
+    MemoryError::Backend(format!("mem0 transport: {msg}"))
 }
 
-/// Replace the password in `base_url` with `***` wherever `base_url` (or its
-/// authority) appears in `msg`. If `base_url` has no userinfo, returns `msg`
-/// unchanged.
-fn redact_userinfo(base_url: &str, msg: &str) -> String {
-    let Some((_scheme, rest)) = base_url.split_once("://") else {
-        return msg.to_string();
-    };
-    let Some(at_idx) = rest.find('@') else {
-        return msg.to_string(); // no userinfo → nothing to redact
-    };
-    let userinfo = &rest[..at_idx];
-    let Some((user, _password)) = userinfo.split_once(':') else {
-        return msg.to_string(); // no password
-    };
-    // Build the redacted base URL and replace occurrences in the message.
-    let host_and_rest = &rest[at_idx..]; // includes the '@'
-    let redacted_url = if let Some((scheme, _)) = base_url.split_once("://") {
-        format!("{scheme}://{user}:***{host_and_rest}")
-    } else {
-        base_url.to_string()
-    };
-    msg.replace(base_url, &redacted_url)
+/// Redact the password from **every** URL embedded in `msg`. Operates on any
+/// `scheme://user:pass@host` occurrence (not just the adapter's base URL), so
+/// full request URLs (`base + /v3/memories/add/`) emitted by reqwest are
+/// covered too. Leaves the scheme, user, host, and path intact; only `pass` is
+/// replaced with `***`.
+fn redact_any_url_userinfo(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for the next "scheme://" start at or after `i`.
+        if let Some(scheme_colon) = find_scheme(msg, i) {
+            let after_scheme = scheme_colon + 3; // skip "://"
+            out.push_str(&msg[i..after_scheme]);
+            // The authority runs to the next path/query/fragment/whitespace.
+            let auth_end = msg[after_scheme..]
+                .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+                .map(|idx| after_scheme + idx)
+                .unwrap_or(msg.len());
+            let authority = &msg[after_scheme..auth_end];
+            if let Some(redacted) = redact_authority_password(authority) {
+                out.push_str(&redacted);
+            } else {
+                out.push_str(authority);
+            }
+            i = auth_end;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Find the index of the `:` in a `scheme://` starting at or after `from`.
+/// Returns `None` if no scheme marker is present. A scheme is
+/// `[a-zA-Z][a-zA-Z0-9+.-]*` followed by `://`.
+fn find_scheme(msg: &str, from: usize) -> Option<usize> {
+    let rest = &msg[from..];
+    let bytes = rest.as_bytes();
+    let mut j = 0;
+    while j < bytes.len() {
+        let c = bytes[j] as char;
+        if c.is_ascii_alphabetic()
+            || (j > 0 && (c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'))
+        {
+            j += 1;
+            continue;
+        }
+        if c == ':' && j > 0 && rest[j..].starts_with("://") {
+            return Some(from + j);
+        }
+        break;
+    }
+    None
+}
+
+/// Given an authority (`user:pass@host:port` or `host:port`), return a version
+/// with the password replaced by `***`, or `None` if there is no userinfo or
+/// no password.
+fn redact_authority_password(authority: &str) -> Option<String> {
+    let at_idx = authority.rfind('@')?;
+    let userinfo = &authority[..at_idx];
+    let host = &authority[at_idx..]; // includes '@'
+    let (user, password) = userinfo.split_once(':')?;
+    if password.is_empty() {
+        return None;
+    }
+    Some(format!("{user}:***{host}"))
 }
 
 // ── response shapes ──────────────────────────────────────────────────────────
@@ -228,18 +289,35 @@ mod tests {
 
     #[test]
     fn redact_userinfo_redacts_password_in_messages() {
-        let base = "https://u:secret@host.example/mem0";
-        let msg = "failed to connect to https://u:secret@host.example/mem0 (timeout)";
-        let redacted = redact_userinfo(base, msg);
+        // The red-team case: reqwest errors include the FULL request URL
+        // (base + path), not just the bare base URL. Redaction must cover it.
+        let msg = "error sending request for url (https://u:secret@host.example/mem0/v3/memories/add/): connection refused";
+        let redacted = redact_any_url_userinfo(msg);
         assert!(!redacted.contains("secret"), "password leaked: {redacted}");
-        assert!(redacted.contains("u:***@host.example"), "got: {redacted}");
+        assert!(
+            redacted.contains("u:***@host.example/mem0/v3/memories/add/"),
+            "got: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_userinfo_handles_multiple_urls() {
+        let msg = "redirected from http://a:pw1@h1/x to https://b:pw2@h2:8080/y";
+        let redacted = redact_any_url_userinfo(msg);
+        assert!(
+            !redacted.contains("pw1") && !redacted.contains("pw2"),
+            "leaked: {redacted}"
+        );
+        assert!(
+            redacted.contains("a:***@h1") && redacted.contains("b:***@h2:8080"),
+            "got: {redacted}"
+        );
     }
 
     #[test]
     fn redact_userinfo_noop_without_password() {
-        let base = "https://api.mem0.ai";
-        let msg = "timeout talking to https://api.mem0.ai";
-        assert_eq!(redact_userinfo(base, msg), msg);
+        let msg = "timeout talking to https://api.mem0.ai/v3/memories/search/";
+        assert_eq!(redact_any_url_userinfo(msg), msg);
     }
 }
 
