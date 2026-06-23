@@ -169,6 +169,9 @@ impl SessionEnv for LocalSessionEnv {
     }
 
     async fn glob(&self, pattern: &str, limit: usize) -> RuntimeResult<Vec<String>> {
+        // Containment: reject absolute patterns and `..` so the model can't
+        // list files outside the root (e.g. `../../*` or `/etc/*`).
+        validate_search_pattern(pattern)?;
         // Glob relative to the root.
         let full = self.root.join(pattern);
         let matched: Vec<PathBuf> = glob_match(&full, limit);
@@ -187,21 +190,24 @@ impl SessionEnv for LocalSessionEnv {
         paths: &[&str],
         max_matches: usize,
     ) -> RuntimeResult<Vec<String>> {
+        // Containment: validate each search path. Reject absolute/`..` so the
+        // model can't search outside the root (e.g. `../.env` or `/etc/passwd`).
+        let mut validated: Vec<String> = Vec::new();
+        if paths.is_empty() {
+            validated.push(".".to_string());
+        } else {
+            for p in paths {
+                validate_search_pattern(p)?;
+                validated.push(shell_quote(p));
+            }
+        }
+        let search = validated.join(" ");
         // Shell out to `rg` if present, else `grep -rn`. Search under root.
         let rg = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!(
                 "rg -n -- {pat} {search} 2>/dev/null || grep -rn -- {pat} {search} 2>/dev/null",
                 pat = shell_quote(pattern),
-                search = if paths.is_empty() {
-                    ".".to_string()
-                } else {
-                    paths
-                        .iter()
-                        .map(|p| shell_quote(p))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                }
             ))
             .current_dir(&self.root)
             .output()
@@ -311,6 +317,29 @@ fn matches_at(n: &[u8], p: &[u8], mut ni: usize, mut pi: usize) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Validate a glob/grep search pattern/path is contained: reject absolute
+/// paths and `..` components so the model can't reach outside the root.
+///
+/// Patterns may legitimately contain `*`/`?` (glob) — only path-structure
+/// escapes are rejected.
+fn validate_search_pattern(input: &str) -> RuntimeResult<()> {
+    // Reject absolute paths.
+    if input.starts_with('/') || input.starts_with('\\') {
+        return Err(RuntimeError::Sandbox(format!(
+            "absolute paths are not allowed: `{input}`"
+        )));
+    }
+    // Reject any `..` path component. Walk segments, ignoring glob wildcards.
+    for seg in input.split('/') {
+        if seg == ".." {
+            return Err(RuntimeError::Sandbox(format!(
+                "`..` is not allowed in search paths: `{input}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Quote a string for safe inclusion in a `sh -c` command.
@@ -427,5 +456,45 @@ mod tests {
         assert!(got.contains("a"));
         assert!(got.contains("b"));
         assert!(got.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_absolute_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env.glob("/etc/*", 10).await;
+        assert!(res.is_err(), "absolute glob patterns must be rejected");
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_parent_dir_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env.glob("../**/*", 10).await;
+        assert!(res.is_err(), "`..` in glob patterns must be rejected");
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env.grep("foo", &["/etc/passwd"], 10).await;
+        assert!(res.is_err(), "absolute grep paths must be rejected");
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_parent_dir_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env.grep("foo", &["../.env"], 10).await;
+        assert!(res.is_err(), "`..` grep paths must be rejected");
     }
 }

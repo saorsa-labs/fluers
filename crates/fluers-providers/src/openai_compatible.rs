@@ -65,7 +65,7 @@ impl OpenAiCompatibleProvider {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             extra_headers: BTreeMap::new(),
         }
     }
@@ -135,6 +135,17 @@ impl OpenAiCompatibleProvider {
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.insert(name.into(), value.into());
         self
+    }
+
+    /// Build the reqwest client with a connect-level timeout so a stalled TCP
+    /// handshake can't hang a turn indefinitely. (The per-turn `turn_timeout_ms`
+    /// budget in the runner is the outer bound; this is defense-in-depth for
+    /// connection establishment specifically.)
+    fn build_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// Run one chat completion (non-streaming). Public so the CLI can call it
@@ -209,10 +220,16 @@ impl OpenAiCompatibleProvider {
 
             use futures::StreamExt;
             let mut byte_stream = resp.bytes_stream();
-            let mut buf = String::new();
+            // Raw byte buffer: we decode only *complete* SSE frames so that
+            // multi-byte UTF-8 chars split across chunk boundaries are not
+            // corrupted by per-chunk lossy decoding.
+            let mut buf: Vec<u8> = Vec::new();
             // Per tool-call-index accumulators: (name, arguments_so_far).
             let mut tool_accum: std::collections::BTreeMap<i64, (String, String)> =
                 std::collections::BTreeMap::new();
+            // Sanity caps to bound memory against a hostile/buggy server.
+            const MAX_SSE_BUFFER: usize = 16 * 1024 * 1024; // 16 MiB
+            const MAX_TOOL_ARGS: usize = 1024 * 1024; // 1 MiB per call
 
             while let Some(chunk_res) = byte_stream.next().await {
                 let chunk = match chunk_res {
@@ -222,26 +239,60 @@ impl OpenAiCompatibleProvider {
                         return;
                     }
                 };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
+                // Bound the buffer so a never-terminating stream can't OOM us.
+                if buf.len() > MAX_SSE_BUFFER {
+                    yield Err(CoreError::ModelResponse(format!(
+                        "SSE buffer exceeded {MAX_SSE_BUFFER} bytes without a frame"
+                    )));
+                    return;
+                }
 
-                // Process complete SSE frames delimited by blank lines.
-                while let Some(blank) = buf.find("\n\n") {
-                    let frame: String = buf.drain(..blank + 2).collect();
+                // Process complete SSE frames. A frame ends with a blank line:
+                // either `\n\n` (LF), `\r\n\r\n` (CRLF), or `\r\r` (CR).
+                loop {
+                    let frame_end = find_frame_end(&buf);
+                    let Some(end) = frame_end else { break };
+                    let frame_bytes: Vec<u8> = buf.drain(..end).collect();
+                    let frame = match String::from_utf8(frame_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // Refuse malformed frames rather than corrupting output.
+                            yield Err(CoreError::ModelResponse(format!(
+                                "SSE frame was not valid UTF-8: {e}"
+                            )));
+                            return;
+                        }
+                    };
                     for line in frame.lines() {
-                        let Some(payload) =
-                            line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))
+                        let line = line.strip_prefix('\r').unwrap_or(line);
+                        let Some(payload) = line
+                            .strip_prefix("data: ")
+                            .or_else(|| line.strip_prefix("data:"))
                         else {
                             continue; // comments (`:`), event lines, blanks
                         };
                         let payload = payload.trim();
+                        if payload.is_empty() {
+                            continue;
+                        }
                         if payload == "[DONE]" {
-                            // Flush buffered tool calls before finishing.
+                            // Flush buffered tool calls before finishing. If a
+                            // call's accumulated arguments aren't valid JSON,
+                            // surface that as an error rather than silently
+                            // wrapping the garbage in `_raw`.
                             for (_, (name, args_json)) in tool_accum.clone().into_iter() {
-                                let input: serde_json::Value =
-                                    serde_json::from_str(&args_json).unwrap_or_else(|_| {
-                                        serde_json::json!({ "_raw": args_json })
-                                    });
-                                yield Ok(StreamEvent::ToolCall(ToolCall { name, input }));
+                                match serde_json::from_str::<serde_json::Value>(&args_json) {
+                                    Ok(input) => {
+                                        yield Ok(StreamEvent::ToolCall(ToolCall { name, input }));
+                                    }
+                                    Err(_) => {
+                                        yield Err(CoreError::ModelResponse(format!(
+                                            "streamed tool `{name}` arguments were not valid JSON on completion"
+                                        )));
+                                        return;
+                                    }
+                                }
                             }
                             yield Ok(StreamEvent::Done);
                             return;
@@ -279,24 +330,51 @@ impl OpenAiCompatibleProvider {
                                     tc.function.as_ref().and_then(|f| f.arguments.clone())
                                 {
                                     entry.1.push_str(&args);
+                                    // Bound per-call argument growth.
+                                    if entry.1.len() > MAX_TOOL_ARGS {
+                                        yield Err(CoreError::ModelResponse(format!(
+                                            "streamed tool arguments exceeded {MAX_TOOL_ARGS} bytes"
+                                        )));
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            // Stream ended without [DONE]; flush tool calls then signal done.
-            for (_, (name, args_json)) in tool_accum {
-                let input: serde_json::Value =
-                    serde_json::from_str(&args_json).unwrap_or_else(|_| {
-                        serde_json::json!({ "_raw": args_json })
-                    });
-                yield Ok(StreamEvent::ToolCall(ToolCall { name, input }));
-            }
-            yield Ok(StreamEvent::Done);
+            // Stream ended without `[DONE]` — that's a truncation. Surface it
+            // rather than silently completing. (The `[DONE]` branch above
+            // returns, so reaching here means no terminator was seen.)
+            yield Err(CoreError::ModelResponse(
+                "stream ended without a [DONE] marker".into(),
+            ));
         };
         Box::pin(s)
     }
+}
+
+/// Find the end of the next SSE frame in `buf`, handling LF / CRLF / CR line
+/// endings. Returns the byte offset *one past* the frame terminator (so the
+/// caller can `drain(..end)`), or `None` if no complete frame is present yet.
+fn find_frame_end(buf: &[u8]) -> Option<usize> {
+    // CRLF first (a `\r\n\r\n` contains `\n\n` at offset+1, but the leading
+    // `\r` would be left behind if we only searched for `\n\n`).
+    if let Some(p) = find_subsequence(buf, b"\r\n\r\n") {
+        return Some(p + 4);
+    }
+    if let Some(p) = find_subsequence(buf, b"\n\n") {
+        return Some(p + 2);
+    }
+    if let Some(p) = find_subsequence(buf, b"\r\r") {
+        return Some(p + 2);
+    }
+    None
+}
+
+/// Find the first occurrence of `needle` in `hay`.
+fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[async_trait]

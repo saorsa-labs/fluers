@@ -177,8 +177,6 @@ async fn collect_streamed_turn(
 ) -> Result<StreamedTurn> {
     use futures::StreamExt;
     let mut turn = StreamedTurn::default();
-    let mut tool_index: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
     let mut s = stream;
     while let Some(item) = s.next().await {
         match item {
@@ -190,15 +188,16 @@ async fn collect_streamed_turn(
                 turn.thinking.push_str(&t);
             }
             Ok(StreamEvent::ToolCall(call)) => {
+                // Streaming tool calls are assigned synthetic `call_N` ids in
+                // arrival order. The provider already buffers full argument
+                // strings before emitting, so no incremental reassembly here.
                 let id = format!("call_{}", turn.tool_calls.len());
-                tool_index.insert(call.name.clone(), turn.tool_calls.len());
                 turn.tool_calls.push((id, call));
             }
             Ok(StreamEvent::Done) => break,
             Err(e) => return Err(e),
         }
     }
-    let _ = tool_index;
     Ok(turn)
 }
 
@@ -406,14 +405,29 @@ async fn execute_tool_calls(
         }
     }
     // Collect and re-order by original index.
-    let mut indexed: Vec<(usize, ToolResult)> = Vec::with_capacity(calls.len());
+    //
+    // A spawned task can panic (JoinSet swallows panics, returning `Err` from
+    // `join_next`). We must still return exactly `calls.len()` results so the
+    // caller's `results[i]` indexing can never panic. Missing/failed slots are
+    // filled with an error result.
+    let mut indexed: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
     while let Some(res) = set.join_next().await {
-        if let Ok(pair) = res {
-            indexed.push(pair);
+        match res {
+            Ok((i, result)) => indexed[i] = Some(result),
+            Err(join_err) => {
+                // Task panicked or was cancelled. Find its slot and fill it.
+                // `join_next` on a panic doesn't report the index, so we fill
+                // the first still-empty slot.
+                let slot = indexed.iter().position(Option::is_none).unwrap_or(0);
+                indexed[slot] = Some(error_result(&format!("tool task failed: {join_err}")));
+            }
         }
     }
-    indexed.sort_by_key(|(i, _)| *i);
-    indexed.into_iter().map(|(_, r)| r).collect()
+    indexed
+        .into_iter()
+        .map(|opt| opt.unwrap_or_else(|| error_result("tool task produced no result")))
+        // Order is already correct (indexed by position); this is a no-op guard.
+        .collect()
 }
 
 /// Build a `ToolResult` carrying a single error text block.
@@ -872,6 +886,72 @@ mod tests {
             tool_ids,
             vec!["c1", "c2"],
             "results must be appended in issued order: {tool_ids:?}"
+        );
+    }
+
+    /// A tool whose `execute` panics. The parallel path must NOT propagate the
+    /// panic; it must fill that slot with an error result and keep going.
+    struct PanickingTool;
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn definition(&self) -> crate::tool::ToolDefinition {
+            crate::tool::ToolDefinition {
+                name: "boom".into(),
+                label: "Boom".into(),
+                description: "Always panics.".into(),
+                parameters: crate::tool::ParameterSchema::default(),
+            }
+        }
+
+        async fn execute(&self, _ctx: InvokeContext, _input: Value) -> Result<ToolResult> {
+            panic!("deliberate tool panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_path_survives_a_task_panic() {
+        // Two tool calls in one turn: one panics, one succeeds. The loop must
+        // not panic; it must append two Tool messages (one error result, one ok).
+        let turn = vec![
+            assistant_tool_use("c1", "boom", json!({})),
+            assistant_tool_use("c2", "echo", json!({ "text": "survived" })),
+        ];
+        let provider = MockProvider::new(vec![turn, vec![assistant_text("done")]]);
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(PanickingTool), Arc::new(EchoTool)];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call both")];
+        let config = RunConfig {
+            tool_concurrency: 4,
+            ..RunConfig::default()
+        };
+
+        // This must not panic.
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &config,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("loop must survive a tool panic");
+
+        assert_eq!(outcome.final_text, "done");
+        // Exactly two Tool messages appended (one per call), in issued order.
+        let tool_ids: Vec<String> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| match &m.content[0] {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_ids,
+            vec!["c1", "c2"],
+            "both results must be present despite the panic: {tool_ids:?}"
         );
     }
 }
