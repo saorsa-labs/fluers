@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+mod config;
 
 use clap::{Parser, Subcommand};
 

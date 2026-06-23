@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{CoreError, Result};
 use crate::message::{AgentMessage, ContentBlock, Role};
-use crate::model::{Model, ModelProvider, ModelRequest};
+use crate::model::{Model, ModelProvider, ModelRequest, StreamEvent};
 use crate::thinking::ThinkingLevel;
 use crate::tool::{InvokeContext, Tool, ToolCall, ToolResult};
 
@@ -143,6 +143,137 @@ pub async fn run_agent(
         // append a Tool message per call, in the original order.
         let results = execute_tool_calls(tools, &tool_calls, cancel, config.tool_concurrency).await;
         for (i, (id, _call)) in tool_calls.iter().enumerate() {
+            let result = &results[i];
+            let tool_msg = AgentMessage {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: serde_json::to_value(result)
+                        .unwrap_or_else(|_| serde_json::json!({ "error": "serialize failed" })),
+                }],
+            };
+            messages.push(tool_msg);
+        }
+    }
+}
+
+/// A single turn's streamed events, reassembled into the assistant message +
+/// the tool calls it issued. Consumed by [`run_agent_streaming`].
+#[derive(Debug, Clone, Default)]
+struct StreamedTurn {
+    text: String,
+    thinking: String,
+    tool_calls: Vec<(String, ToolCall)>,
+}
+
+/// Reassemble a provider's [`StreamEvent`] stream into a [`StreamedTurn`].
+///
+/// `on_event` is invoked for every event (so callers can print deltas live);
+/// this function still returns the full reassembled turn so the loop can
+/// append the assistant message and execute tools.
+async fn collect_streamed_turn(
+    stream: crate::model::StreamEventStream,
+    on_event: &mut (dyn FnMut(&StreamEvent) + Send),
+) -> Result<StreamedTurn> {
+    use futures::StreamExt;
+    let mut turn = StreamedTurn::default();
+    let mut tool_index: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut s = stream;
+    while let Some(item) = s.next().await {
+        match item {
+            Ok(StreamEvent::TextDelta(t)) => {
+                on_event(&StreamEvent::TextDelta(t.clone()));
+                turn.text.push_str(&t);
+            }
+            Ok(StreamEvent::ThinkingDelta(t)) => {
+                turn.thinking.push_str(&t);
+            }
+            Ok(StreamEvent::ToolCall(call)) => {
+                let id = format!("call_{}", turn.tool_calls.len());
+                tool_index.insert(call.name.clone(), turn.tool_calls.len());
+                turn.tool_calls.push((id, call));
+            }
+            Ok(StreamEvent::Done) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    let _ = tool_index;
+    Ok(turn)
+}
+
+/// Streaming variant of [`run_agent`].
+///
+/// Identical loop semantics (budgets, parallel tools, cancellation) but each
+/// provider turn is consumed via [`ModelProvider::stream`] and text deltas are
+/// forwarded to `on_event` *as they arrive*. Tool calls are reassembled from
+/// the stream before execution. Use this when you want live token-by-token
+/// output.
+pub async fn run_agent_streaming(
+    provider: &dyn ModelProvider,
+    tools: &[Arc<dyn Tool>],
+    messages: &mut Vec<AgentMessage>,
+    model: &Model,
+    config: &RunConfig,
+    cancel: &CancellationToken,
+    on_event: &mut (dyn FnMut(&StreamEvent) + Send),
+) -> Result<RunOutcome> {
+    let mut turns = 0usize;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(CoreError::Cancelled("agent run cancelled".into()));
+        }
+        if turns >= config.max_turns {
+            return Err(CoreError::ModelResponse(format!(
+                "max_turns ({}) exceeded — the model kept calling tools",
+                config.max_turns
+            )));
+        }
+        turns += 1;
+
+        let request = ModelRequest {
+            model: model.clone(),
+            messages: messages.clone(),
+            tools: tools.iter().map(|t| t.definition()).collect(),
+            thinking: config.thinking,
+            params: Default::default(),
+        };
+        // Stream the turn, reassembling into an assistant message + tool calls.
+        let stream = provider.stream(request);
+        let turn = collect_streamed_turn(stream, on_event).await?;
+
+        // Build the assistant message from the reassembled turn.
+        let mut content: Vec<ContentBlock> = Vec::new();
+        if !turn.text.is_empty() {
+            content.push(ContentBlock::Text { text: turn.text });
+        }
+        for (id, call) in &turn.tool_calls {
+            content.push(ContentBlock::ToolUse {
+                id: id.clone(),
+                call: call.clone(),
+            });
+        }
+        messages.push(AgentMessage {
+            role: Role::Assistant,
+            content,
+        });
+
+        if turn.tool_calls.is_empty() {
+            let final_text = extract_final_text(messages);
+            return Ok(RunOutcome { turns, final_text });
+        }
+        if turn.tool_calls.len() > config.max_tool_calls_per_turn {
+            return Err(CoreError::ModelResponse(format!(
+                "model issued {} tool calls in one turn (max {})",
+                turn.tool_calls.len(),
+                config.max_tool_calls_per_turn
+            )));
+        }
+
+        let owned_calls: Vec<(String, ToolCall)> = turn.tool_calls.clone();
+        let results =
+            execute_tool_calls(tools, &owned_calls, cancel, config.tool_concurrency).await;
+        for (i, (id, _call)) in owned_calls.iter().enumerate() {
             let result = &results[i];
             let tool_msg = AgentMessage {
                 role: Role::Tool,

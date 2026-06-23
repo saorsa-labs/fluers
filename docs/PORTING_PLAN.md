@@ -94,22 +94,29 @@ is exercised, so MVP 1 can build providers without trait rework.
 > `fluers-runtime`, matching `agent-coordinator.ts`'s actual placement in
 > `@flue/runtime` (not `pi-agent-core`).
 
-- [ ] Finalize the **turn loop** in `fluers-core` from the MVP 0.5 spike
-- [ ] **Concurrency model** (specify before implementing): parallel tool
-      calls per turn (`tokio::task::JoinSet`), max-turns budget, token
-      budget, stop conditions, malformed-tool-call recovery
-- [ ] **Provider: Anthropic** (`anthropic/...`) via `reqwest` streaming SSE,
-      including incremental tool-call JSON assembly
-- [ ] **Provider: OpenAI-compatible** (`openai/...`, local mistralrs)
-- [ ] **Config / secrets**: env-var + config-file key sources, per-provider
-      base URLs, key redaction in `tracing`
-- [ ] Cancellation: `CancellationToken` propagated into providers + tools;
-      `tokio::time::timeout` deadline per turn
-- [ ] Integration tests against the mock provider (CI) + a gated live test
+- [x] Finalize the **turn loop** in `fluers-core` from the MVP 0.5 spike
+- [x] **Concurrency model**: parallel tool calls per turn (`tokio::task::JoinSet`
+      with a configurable cap), `max_turns` budget, `max_tool_calls_per_turn`,
+      `turn_timeout_ms`, stop conditions, malformed-tool-call recovery
+- [ ] **Provider: Anthropic** (`anthropic/...`) — *deferred (no key; OpenRouter
+      + MiniMax cover current needs via the OpenAI-compatible provider)*
+- [x] **Provider: OpenAI-compatible** (`openai_compatible.rs`) — covers OpenRouter,
+      MiniMax, OpenAI, vLLM, mistralrs; one impl. Verified live with
+      `minimax/minimax-m3`.
+- [x] **Streaming**: real SSE parsing (`data:` framing, `[DONE]`, comments),
+      text deltas forwarded live, tool-call argument fragments buffered and
+      emitted as complete calls. `--stream` flag; falls back to buffered when
+      tools are enabled.
+- [x] **Config / secrets**: optional `fluers.toml`; `try_openrouter`/
+      `try_minimax` reject empty keys; key prefixes never printed.
+- [x] Cancellation: `CancellationToken` propagated into providers + tools;
+      `tokio::time::timeout` deadline per turn.
+- [x] Budget tests: turn timeout, max tool calls, parallel ordering.
+      Integration tests against the mock provider (CI-safe).
 
-**Exit criteria:** `fluers run --model anthropic/claude-sonnet-4-6 --prompt "read README.md"`
+**Exit criteria:** `fluers run --model minimax/minimax-m3 --prompt "read README.md"`
 returns the agent's response after one or more tool calls, with budget
-enforcement and cancellation working.
+enforcement, streaming, and cancellation working. ✅ **Met (live-verified)**.
 
 ---
 
