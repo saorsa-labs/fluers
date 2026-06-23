@@ -52,6 +52,7 @@ jsonschema = "0.22"
 
 # Cancellation / async utilities
 tokio-util = "0.7"
+async-stream = "0.3"
 
 # Base64 for image attachments (replaces hand-rolled codec).
 base64 = "0.22"
