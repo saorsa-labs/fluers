@@ -21,6 +21,9 @@ pub trait PersistenceAdapter: Send + Sync {
 
     /// Load a session's serialized state.
     async fn load_session(&self, id: &str) -> Result<Option<Value>>;
+
+    /// List all known session ids (for discovery / `--resume`).
+    async fn list_sessions(&self) -> Result<Vec<String>>;
 }
 
 /// Errors from the persistence layer.
