@@ -242,3 +242,175 @@ mod tests {
         assert_eq!(redact_userinfo(base, msg), msg);
     }
 }
+
+#[cfg(test)]
+mod mock_tests {
+    //! Mock-HTTP-server tests for [`Mem0RestAdapter`]. These start a local
+    //! `wiremock` server and assert the adapter sends the exact paths, headers,
+    //! and request bodies defined in the wire contract, then parses the
+    //! responses correctly. No live mem0 required.
+    use super::*;
+    use crate::{MemoryAdapter, MemoryAddRequest, MemoryMessage, MemorySearchRequest};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn adapter(server: &MockServer) -> Mem0RestAdapter {
+        Mem0RestAdapter::new(server.uri(), "test-key-123").expect("build adapter")
+    }
+
+    #[tokio::test]
+    async fn add_posts_to_correct_path_with_token_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/memories/add/"))
+            .and(header("authorization", "Token test-key-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"id": "mem-1", "memory": "prefers dark mode", "event": "ADD"}],
+                "relations": []
+            })))
+            .mount(&server)
+            .await;
+
+        let adapter = adapter(&server);
+        let resp = adapter
+            .add(&MemoryAddRequest {
+                user_id: "alice".into(),
+                messages: vec![MemoryMessage {
+                    role: "user".into(),
+                    content: "I like dark mode".into(),
+                }],
+                metadata: None,
+            })
+            .await
+            .expect("add");
+        assert_eq!(resp.ids, vec!["mem-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn search_posts_query_filters_and_top_k() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/memories/search/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    {"id": "a", "memory": "prefers vim", "score": 0.9},
+                    {"id": "b", "memory": "likes rust", "score": 0.7}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let adapter = adapter(&server);
+        let hits = adapter
+            .search(&MemorySearchRequest {
+                user_id: "alice".into(),
+                query: "editor".into(),
+                top_k: 5,
+            })
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].memory, "prefers vim");
+        assert_eq!(hits[0].score, Some(0.9));
+
+        // Assert the request body had the right shape.
+        let req = &server.received_requests().await.expect("requests")[0];
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body json");
+        assert_eq!(body["query"], "editor");
+        assert_eq!(body["top_k"], 5);
+        assert_eq!(body["filters"]["user_id"], "alice");
+    }
+
+    #[tokio::test]
+    async fn search_trims_query_before_sending() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/memories/search/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = adapter(&server);
+        let _ = adapter
+            .search(&MemorySearchRequest {
+                user_id: "alice".into(),
+                query: "  padded query  ".into(),
+                top_k: 3,
+            })
+            .await;
+
+        let req = &server.received_requests().await.expect("requests")[0];
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body json");
+        assert_eq!(body["query"], "padded query", "query was not trimmed");
+    }
+
+    #[tokio::test]
+    async fn clear_deletes_with_user_id_query_param() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/memories/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"message": "deleted"})),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = adapter(&server);
+        adapter.clear("alice").await.expect("clear");
+
+        let req = &server.received_requests().await.expect("requests")[0];
+        assert!(req.url.query().is_some_and(|q| q.contains("user_id=alice")));
+    }
+
+    #[tokio::test]
+    async fn non_2xx_returns_backend_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/memories/search/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+
+        let adapter = adapter(&server);
+        let err = adapter
+            .search(&MemorySearchRequest {
+                user_id: "alice".into(),
+                query: "x".into(),
+                top_k: 1,
+            })
+            .await;
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("401"), "missing status: {msg}");
+        assert!(msg.contains("unauthorized"), "missing body: {msg}");
+    }
+
+    #[tokio::test]
+    async fn empty_api_key_omits_auth_header() {
+        // An empty key is allowed; no Authorization header is sent.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/memories/add/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": []
+            })))
+            .mount(&server)
+            .await;
+
+        let adapter = Mem0RestAdapter::new(server.uri(), "").expect("build adapter");
+        let _ = adapter
+            .add(&MemoryAddRequest {
+                user_id: "alice".into(),
+                messages: vec![MemoryMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                metadata: None,
+            })
+            .await;
+        let req = &server.received_requests().await.expect("requests")[0];
+        assert!(!req.headers.contains_key("authorization"));
+    }
+}

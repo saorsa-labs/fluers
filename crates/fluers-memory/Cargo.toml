@@ -24,3 +24,4 @@ parking_lot.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+wiremock = "0.6"
