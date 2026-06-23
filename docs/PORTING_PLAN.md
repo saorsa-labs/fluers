@@ -196,20 +196,37 @@ image.
 
 ---
 
-## MVP 4 — MCP, remote sandboxes, postgres, telemetry
+## MVP 4 — MCP, remote sandboxes, memory, telemetry
 
 **Goal:** feature parity with Flue's adapter ecosystem.
+
+> **Memory-layer decision (mem0 research, 2026-06):** mem0 is a
+> **complement**, not a replacement for Postgres. mem0 is a *semantic*
+> memory layer — it extracts salient facts from conversations via an LLM
+> and retrieves them via hybrid search (semantic + BM25 + entity). It is
+> **lossy by design** (ADD-only extraction, raw transcripts discarded), so
+> it **cannot** serve as a `PersistenceAdapter` for faithful resume-after-
+> kill. Plan: keep `PersistenceAdapter` (JsonFile/Postgres/SQLite) for exact
+> session-state replay; add a **separate** `fluers-memory` crate +
+> `MemoryAdapter` trait (`add`/`search`/`clear`) for long-term semantic
+> memory, wired as a `TurnSink` (extract+store after each turn) and injected
+> into the system prompt at session start. No Rust SDK → hit the REST API
+> via `reqwest`; self-host via `docker compose` (Qdrant + dashboard).
 
 - [ ] `fluers-mcp`: stdio + HTTP-SSE transports; expose MCP servers' tools as
       `fluers-core::Tool`s (mirror `runtime/src/mcp.ts`)
 - [ ] Remote container sandbox (E2B / Daytona) behind the `Sandbox` trait
-- [ ] `fluers-postgres`: `sqlx`-backed `PersistenceAdapter`
+- [ ] `fluers-postgres`: `sqlx`-backed `PersistenceAdapter` (for session
+      replay — *not* replaced by mem0)
+- [ ] `fluers-memory`: `MemoryAdapter` trait + mem0 REST adapter (semantic
+      long-term memory — the new capability mem0 enables)
 - [ ] `fluers-otel`: OTLP spans/metrics exporter wired to the `EventBus`
 - [ ] Subagent delegation & depth limits (the `agent-coordinator` submission/
       dispatch machinery: `SubagentNotDeclared`, `DelegationDepthExceeded`, …)
 
 **Exit criteria:** an agent that delegates to a subagent, runs tools in a
-remote container, persists to Postgres, and emits OTel traces.
+remote container, persists sessions to Postgres for resume, recalls user
+preferences via mem0, and emits OTel traces.
 
 ---
 
