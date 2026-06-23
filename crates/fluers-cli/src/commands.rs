@@ -222,6 +222,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             &config,
             &cancel,
             &mut on_event,
+            None,
         )
         .await
         .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
@@ -234,9 +235,17 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         eprintln!("→ note: streaming + tools together falls back to buffered mode");
     }
 
-    let outcome = run_agent(&provider, &tools, &mut messages, &model, &config, &cancel)
-        .await
-        .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
+    let outcome = run_agent(
+        &provider,
+        &tools,
+        &mut messages,
+        &model,
+        &config,
+        &cancel,
+        None,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
 
     eprintln!("→ done in {} turn(s)", outcome.turns);
     println!("{}", outcome.final_text);

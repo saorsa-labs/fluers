@@ -124,16 +124,39 @@ enforcement, streaming, and cancellation working. ✅ **Met (live-verified)**.
 
 **Goal:** durable, observable sessions.
 
-- [ ] Full `SKILL.md` frontmatter schema (`name`, `description`, `triggers`,
-      `model`, …) + packaged-skill discovery under `/.flue/packaged-skills/`
-      (use a real frontmatter parser, not the MVP `split_once` heuristic)
-- [ ] Skill injection into the system prompt (Flue's skill-loading semantics)
-- [ ] `PersistenceAdapter` finalized; `SessionStore` made generic over it
-- [ ] **JSON-file persistence adapter** (so "resume after kill" works without
-           Postgres, which is MVP 4)
-- [ ] Event stream: turn/tool lifecycle events + an `observe` subscriber API
-      (with backpressure — bounded channel, no recursive emit)
-- [ ] Resumable sessions (load → continue)
+> **MVP 2 design decisions (from the pre-MVP-2 plan review):**
+>
+> 1. **Per-turn seam.** `run_agent`/`run_agent_streaming` in `fluers-core`
+>    gain an optional `&dyn TurnSink` parameter, invoked after each turn's
+>    messages are appended (and awaited, so persistence of turn *N* completes
+>    before turn *N+1* — required for faithful resume-after-kill). This keeps
+>    `fluers-core` pure (no `EventBus`/`SessionStore` dependency) while
+>    unblocking persistence, events, and incremental appends.
+> 2. **Persistence model.** `SessionStore` stays sync + in-memory; new
+>    `async fn save/load` serialize the whole `Session` to a `Value` via the
+>    adapter. `append` stays sync (no per-message disk I/O).
+> 3. **Typed persisted envelope.** A serde `SessionState` struct carries
+>    `schema_version`, `model`, `run_config`, `system_message`, `messages`,
+>    `metadata`. Drops the `HashMap<String,String>` metadata for structured
+>    state. `list_sessions` added for discovery.
+> 4. **Deferred from MVP 2** (flagged, not blocking resume): full skill
+>    frontmatter schema + injection (greenfield), EventBus → bounded-channel
+>    rewrite (ripples to `fluers-otel`).
+
+- [ ] **Per-turn `TurnSink` seam** in `fluers-core` (`run_agent` +
+      `run_agent_streaming`)
+- [ ] Typed `SessionState` envelope (`schema_version` + resume fields)
+- [ ] `SessionStore`: sync in-memory + `async save/load` over the adapter +
+      `list_sessions`
+- [ ] **JSON-file persistence adapter** (`JsonFileAdapter`) so "resume after
+      kill" works without Postgres (MVP 4)
+- [ ] `SessionRunner` coordinator in `fluers-runtime` wiring sink → persist
+- [ ] CLI `--session <id>`: create+print on new, load+resume on existing
+- [ ] Resumable sessions integration test (create → run → persist → reload →
+      continue)
+- [ ] Full `SKILL.md` frontmatter schema + injection *(deferred — greenfield)*
+- [ ] Event stream: bounded-channel `EventBus` rewrite *(deferred — ripples
+      to `fluers-otel`)*
 
 **Exit criteria:** start a session, run several turns, kill the process,
 resume from the JSON-file persisted state.

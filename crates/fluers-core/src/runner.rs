@@ -60,6 +60,27 @@ pub struct RunOutcome {
     pub final_text: String,
 }
 
+/// A sink notified after each turn's messages are appended to the history.
+///
+/// This is the per-turn **seam** that lets a coordinator (in
+/// `fluers-runtime`) persist a session, emit events, or snapshot state
+/// between turns — *without* `fluers-core` depending on any of those
+/// subsystems. It keeps the loop-home decision intact: the pure turn-loop
+/// stays in `fluers-core`; the coordinator that drives persistence/events
+/// lives in `fluers-runtime`.
+///
+/// The sink is `await`ed inside the loop after each turn's messages (both
+/// the assistant turn and the tool results) are appended, so persistence of
+/// turn *N* completes before turn *N+1* begins. That ordering is what makes
+/// "resume-after-kill" faithful: the file on disk always reflects at least
+/// all completed turns.
+#[async_trait::async_trait]
+pub trait TurnSink: Send + Sync {
+    /// Called after turn `turn` (1-indexed) with the full message history so
+    /// far. Returning `Err` aborts the run with that error.
+    async fn after_turn(&self, turn: usize, messages: &[AgentMessage]) -> Result<()>;
+}
+
 /// Run the agent loop.
 ///
 /// `messages` is seeded by the caller (typically a `System` message followed
@@ -84,6 +105,7 @@ pub async fn run_agent(
     model: &Model,
     config: &RunConfig,
     cancel: &CancellationToken,
+    on_turn: Option<&dyn TurnSink>,
 ) -> Result<RunOutcome> {
     let mut turns = 0usize;
     loop {
@@ -127,6 +149,10 @@ pub async fn run_agent(
         if tool_calls.is_empty() {
             // No tool calls ⇒ the model finished. Extract final text.
             let final_text = extract_final_text(messages);
+            // Notify the sink so the final state is persisted before returning.
+            if let Some(sink) = on_turn {
+                sink.after_turn(turns, messages).await?;
+            }
             return Ok(RunOutcome { turns, final_text });
         }
 
@@ -153,6 +179,12 @@ pub async fn run_agent(
                 }],
             };
             messages.push(tool_msg);
+        }
+        // End of turn: notify the sink so the coordinator can persist/observe
+        // before the next turn begins. Persistence of turn N must complete
+        // before turn N+1 starts — this is what makes resume-after-kill faithful.
+        if let Some(sink) = on_turn {
+            sink.after_turn(turns, messages).await?;
         }
     }
 }
@@ -208,6 +240,7 @@ async fn collect_streamed_turn(
 /// forwarded to `on_event` *as they arrive*. Tool calls are reassembled from
 /// the stream before execution. Use this when you want live token-by-token
 /// output.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_streaming(
     provider: &dyn ModelProvider,
     tools: &[Arc<dyn Tool>],
@@ -216,6 +249,7 @@ pub async fn run_agent_streaming(
     config: &RunConfig,
     cancel: &CancellationToken,
     on_event: &mut (dyn FnMut(&StreamEvent) + Send),
+    on_turn: Option<&dyn TurnSink>,
 ) -> Result<RunOutcome> {
     let mut turns = 0usize;
     loop {
@@ -259,6 +293,10 @@ pub async fn run_agent_streaming(
 
         if turn.tool_calls.is_empty() {
             let final_text = extract_final_text(messages);
+            // Notify the sink so the final state is persisted before returning.
+            if let Some(sink) = on_turn {
+                sink.after_turn(turns, messages).await?;
+            }
             return Ok(RunOutcome { turns, final_text });
         }
         if turn.tool_calls.len() > config.max_tool_calls_per_turn {
@@ -283,6 +321,10 @@ pub async fn run_agent_streaming(
                 }],
             };
             messages.push(tool_msg);
+        }
+        // End of turn: notify the sink (see `run_agent` for rationale).
+        if let Some(sink) = on_turn {
+            sink.after_turn(turns, messages).await?;
         }
     }
 }
@@ -578,6 +620,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("loop should complete");
@@ -612,6 +655,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("loop should complete");
@@ -639,6 +683,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("loop should recover");
@@ -667,6 +712,7 @@ mod tests {
                 ..RunConfig::default()
             },
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -690,6 +736,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &cancel,
+            None,
         )
         .await;
 
@@ -748,6 +795,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -779,6 +827,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -858,6 +907,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("loop should complete");
@@ -934,6 +984,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("loop must survive a tool panic");

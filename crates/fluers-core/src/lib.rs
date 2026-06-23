@@ -35,7 +35,7 @@ pub mod tool;
 pub use error::{CoreError, Result};
 pub use message::{AgentMessage, ContentBlock, ImageContent, Role, SignalMessage};
 pub use model::{Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent};
-pub use runner::{run_agent, run_agent_streaming, RunConfig, RunOutcome};
+pub use runner::{run_agent, run_agent_streaming, RunConfig, RunOutcome, TurnSink};
 pub use thinking::ThinkingLevel;
 pub use tool::{
     InvokeContext, JsonValue, ParameterSchema, Tool, ToolCall, ToolDefinition, ToolResult,
