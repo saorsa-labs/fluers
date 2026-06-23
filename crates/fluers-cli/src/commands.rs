@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use fluers_core::message::{AgentMessage, ContentBlock, Role};
 use fluers_core::tool::Tool;
-use fluers_core::{run_agent, Model, RunConfig};
+use fluers_core::{run_agent, run_agent_streaming, Model, RunConfig, StreamEvent};
 use fluers_providers::OpenAiCompatibleProvider;
 use fluers_runtime::{Limits, LocalSessionEnv};
 use tokio_util::sync::CancellationToken;
@@ -166,19 +166,10 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         list_sessions: false,
     };
 
-    let provider = build_provider(&merged)?;
-    let env: Arc<dyn fluers_runtime::SessionEnv> =
-        Arc::new(LocalSessionEnv::new(&workdir, Limits::default()).await?);
-
-    let tools: Vec<Arc<dyn Tool>> = if merged.no_tools {
-        Vec::new()
-    } else {
-        fluers_runtime::mvp_tools(env.clone())
-    };
-
     // ── Session persistence setup ──────────────────────────────────────────
     // Resolve the sessions directory (default ~/.fluers/sessions) and build a
-    // JSON-file adapter. Then either resume an existing session or create one.
+    // JSON-file adapter. `--list-sessions` is handled here, before provider/env
+    // setup, so it works without an API key.
     let sessions_dir = merged.sessions_dir.clone().unwrap_or_else(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home).join(".fluers").join("sessions")
@@ -186,7 +177,6 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     let adapter: Arc<dyn fluers_runtime::PersistenceAdapter> =
         Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir));
 
-    // `--list-sessions`: print ids and exit.
     if args.list_sessions {
         let ids = adapter
             .list_sessions()
@@ -202,6 +192,16 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let provider = build_provider(&merged)?;
+    let env: Arc<dyn fluers_runtime::SessionEnv> =
+        Arc::new(LocalSessionEnv::new(&workdir, Limits::default()).await?);
+
+    let tools: Vec<Arc<dyn Tool>> = if merged.no_tools {
+        Vec::new()
+    } else {
+        fluers_runtime::mvp_tools(env.clone())
+    };
+
     // Resolve the session id: explicit --session, else generate a new one.
     let session_id = match &merged.session {
         Some(s) => uuid::Uuid::parse_str(s)
@@ -209,59 +209,74 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         None => uuid::Uuid::new_v4(),
     };
 
-    // Try to load an existing session with this id.
-    let runner = fluers_runtime::SessionRunner::load(adapter.clone(), session_id).await?;
-    let resuming = runner.is_some();
+    // Try to load an existing session. If found, the loaded runner becomes
+    // the TurnSink — preserving its persisted model, max_turns, system_message,
+    // and metadata. On resume, persisted config values win.
+    let loaded = fluers_runtime::SessionRunner::load(adapter.clone(), session_id).await?;
+    let resuming = loaded.is_some();
 
-    let model_id = merged
-        .model
-        .as_deref()
-        .unwrap_or("minimax/minimax-m3")
-        .to_string();
-    let max_turns = merged.max_turns.unwrap_or(12);
-
-    let mut messages: Vec<AgentMessage> = match runner {
-        Some(r) => r.messages(),
-        None => Vec::new(),
+    let (model_id, max_turns, system_message, mut messages) = match loaded {
+        Some(ref r) => {
+            let mut msgs = r.messages();
+            if let Some(prompt) = &merged.prompt {
+                msgs.push(AgentMessage {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: prompt.clone(),
+                    }],
+                });
+            }
+            (
+                r.model_id().to_string(),
+                r.max_turns(),
+                r.system_message(),
+                msgs,
+            )
+        }
+        None => {
+            let system = "You are a Fluers agent. Use the provided tools when they help. \
+                          Paths are relative to the working directory. Be concise.";
+            let prompt = merged
+                .prompt
+                .clone()
+                .unwrap_or_else(|| "No prompt given. Greet the user briefly.".to_string());
+            let msgs = vec![
+                AgentMessage {
+                    role: Role::System,
+                    content: vec![ContentBlock::Text {
+                        text: system.into(),
+                    }],
+                },
+                AgentMessage {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: prompt }],
+                },
+            ];
+            (
+                merged
+                    .model
+                    .as_deref()
+                    .unwrap_or("minimax/minimax-m3")
+                    .to_string(),
+                merged.max_turns.unwrap_or(12),
+                Some(system.to_string()),
+                msgs,
+            )
+        }
     };
 
-    if resuming {
-        eprintln!(
-            "→ resumed session {session_id} ({} prior messages)",
-            messages.len()
-        );
-        // When resuming, append the prompt (if any) as a new user turn.
-        if let Some(prompt) = &merged.prompt {
-            messages.push(AgentMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: prompt.clone(),
-                }],
-            });
-        }
-    } else {
-        // New session: seed system message + user prompt.
-        let system = "You are a Fluers agent. Use the provided tools when they help. \
-                      Paths are relative to the working directory. Be concise.";
-        let prompt = merged
-            .prompt
-            .clone()
-            .unwrap_or_else(|| "No prompt given. Greet the user briefly.".to_string());
-        messages.push(AgentMessage {
-            role: Role::System,
-            content: vec![ContentBlock::Text {
-                text: system.into(),
-            }],
-        });
-        messages.push(AgentMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text { text: prompt }],
-        });
-    }
-
     // Build the session runner (TurnSink) that persists after each turn.
-    let runner =
-        fluers_runtime::SessionRunner::new(adapter, session_id, model_id.clone(), max_turns, None);
+    // Reuse the loaded runner if we have one; otherwise create a new one.
+    let runner = match loaded {
+        Some(r) => r,
+        None => fluers_runtime::SessionRunner::new(
+            adapter,
+            session_id,
+            model_id.clone(),
+            max_turns,
+            system_message,
+        ),
+    };
     let runner_ref: &dyn fluers_core::TurnSink = &runner;
 
     let model = Model::new(&model_id);
@@ -273,6 +288,14 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     let cancel = CancellationToken::new();
 
+    if resuming {
+        let prior = if merged.prompt.is_some() {
+            messages.len().saturating_sub(1)
+        } else {
+            messages.len()
+        };
+        eprintln!("→ resumed session {session_id} ({prior} prior messages)");
+    }
     eprintln!(
         "→ session: {session_id}   model: {model_id}   provider: {}   tools: {}",
         merged.provider.as_deref().unwrap_or("openrouter"),
@@ -283,6 +306,38 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         workdir.display(),
         config.tool_concurrency
     );
+
+    // Streaming path: token-by-token output (text-only). Also persists via
+    // the TurnSink after each turn.
+    if merged.stream && tools.is_empty() {
+        let mut on_event = |ev: &StreamEvent| {
+            if let StreamEvent::TextDelta(t) = ev {
+                print!("{t}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+        };
+        let outcome = run_agent_streaming(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &config,
+            &cancel,
+            &mut on_event,
+            Some(runner_ref),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
+        println!();
+        eprintln!("→ done in {} turn(s)", outcome.turns);
+        eprintln!("→ session persisted: {session_id}  (resume with --session {session_id})");
+        return Ok(());
+    }
+
+    if merged.stream && !tools.is_empty() {
+        eprintln!("→ note: streaming + tools together falls back to buffered mode");
+    }
 
     let outcome = run_agent(
         &provider,

@@ -64,6 +64,24 @@ impl SessionRunner {
         self.messages.read().clone()
     }
 
+    /// The model id this session runs against.
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    /// The max-turns budget for this session.
+    #[must_use]
+    pub fn max_turns(&self) -> usize {
+        self.max_turns
+    }
+
+    /// The system message (instructions) for this session, if any.
+    #[must_use]
+    pub fn system_message(&self) -> Option<String> {
+        self.system_message.clone()
+    }
+
     fn from_session(adapter: Arc<dyn PersistenceAdapter>, session: Session) -> Self {
         Self {
             adapter,
