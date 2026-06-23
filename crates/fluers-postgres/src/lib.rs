@@ -41,4 +41,10 @@ impl PersistenceAdapter for PostgresAdapter {
             "PostgresAdapter not yet implemented (see PORTING_PLAN.md MVP 4)".into(),
         ))
     }
+
+    async fn list_sessions(&self) -> Result<Vec<String>> {
+        Err(PersistenceError::Backend(
+            "PostgresAdapter not yet implemented (see PORTING_PLAN.md MVP 4)".into(),
+        ))
+    }
 }
