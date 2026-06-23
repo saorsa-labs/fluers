@@ -1,0 +1,36 @@
+[package]
+name = "fluers-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "axum HTTP server exposing Fluers agents (dispatch / invoke / stream / runs)"
+
+[lints]
+workspace = true
+
+[dependencies]
+fluers-core.workspace = true
+fluers-runtime.workspace = true
+fluers-protocol.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+futures.workspace = true
+tokio-stream = "0.1"
+parking_lot.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+async-stream = "0.3"
+tower = { workspace = true, features = ["util"] }

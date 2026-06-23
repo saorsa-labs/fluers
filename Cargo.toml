@@ -4,6 +4,8 @@ members = [
     "crates/fluers-core",
     "crates/fluers-runtime",
     "crates/fluers-providers",
+    "crates/fluers-protocol",
+    "crates/fluers-server",
     "crates/fluers-cli",
     "crates/fluers-sdk",
     "crates/fluers-mcp",
@@ -87,11 +89,14 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytes = "1"
 parking_lot = "0.12"
+tempfile = "3"
 
 # Internal crates
 fluers-core = { path = "crates/fluers-core", version = "0.1.0" }
 fluers-runtime = { path = "crates/fluers-runtime", version = "0.1.0" }
 fluers-providers = { path = "crates/fluers-providers", version = "0.1.0" }
+fluers-protocol = { path = "crates/fluers-protocol", version = "0.1.0" }
+fluers-server = { path = "crates/fluers-server", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

@@ -79,6 +79,21 @@ pub(crate) struct DevArgs {
     /// Port to serve on.
     #[arg(long, default_value_t = 3000)]
     pub port: u16,
+    /// Provider backend (default `openrouter`).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model id.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Working directory the sandbox is rooted in.
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+    /// Directory for JSON session files (default: `~/.fluers/sessions`).
+    #[arg(long)]
+    pub sessions_dir: Option<PathBuf>,
+    /// Disable all tools (text-only agent).
+    #[arg(long, default_value_t = false)]
+    pub no_tools: bool,
 }
 
 /// Args for `deploy`.
@@ -357,10 +372,64 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `fluers dev` (stub).
+/// `fluers dev` — boot the local HTTP server with a default agent.
 pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
-    println!("✓ dev server would listen on :{} (stub — MVP 3)", args.port);
-    Ok(())
+    let provider = build_provider(&RunArgs {
+        provider: args.provider.clone(),
+        model: args.model.clone(),
+        base_url: None,
+        prompt: None,
+        workdir: None,
+        max_turns: None,
+        turn_timeout_ms: None,
+        tool_concurrency: None,
+        no_tools: args.no_tools,
+        stream: false,
+        api_key_env: None,
+        config: None,
+        session: None,
+        sessions_dir: None,
+        list_sessions: false,
+    })?;
+    let workdir = args
+        .workdir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let env: Arc<dyn fluers_runtime::SessionEnv> =
+        Arc::new(LocalSessionEnv::new(&workdir, Limits::default()).await?);
+    let tools: Vec<Arc<dyn Tool>> = if args.no_tools {
+        Vec::new()
+    } else {
+        fluers_runtime::mvp_tools(env.clone())
+    };
+    let sessions_dir = args.sessions_dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".fluers").join("sessions")
+    });
+    let sessions: Arc<dyn fluers_runtime::PersistenceAdapter> =
+        Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir));
+    let state = Arc::new(fluers_server::ServerState::new(sessions));
+    let handle = fluers_server::AgentHandle {
+        provider: Arc::new(provider),
+        model: Model::new(args.model.as_deref().unwrap_or("minimax/minimax-m3")),
+        tools,
+        config: RunConfig::default(),
+        system_prompt: "You are a Fluers agent. Use the provided tools when they help. \
+                        Paths are relative to the working directory. Be concise."
+            .into(),
+        description: "default Fluers agent".into(),
+    };
+    state.register("default", handle);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
+    eprintln!("→ fluers dev server");
+    eprintln!("  endpoints:");
+    eprintln!("    GET    /health");
+    eprintln!("    GET    /agents");
+    eprintln!("    POST   /agents/default/invoke");
+    eprintln!("    POST   /agents/default/stream");
+    eprintln!("    GET    /runs/{{run_id}}");
+    fluers_server::serve(addr, state).await
 }
 
 /// `fluers build` (stub).
