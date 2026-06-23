@@ -11,6 +11,63 @@ use fluers_providers::OpenAiCompatibleProvider;
 use fluers_runtime::{Limits, LocalSessionEnv};
 use tokio_util::sync::CancellationToken;
 
+/// Redact the password component of any `postgres://user:pass@host` URL
+/// embedded in a driver error string, so credentials never leak to stderr
+/// or downstream logs. Leaves the rest of the message intact for debugging.
+fn redact_postgres_url(message: &str) -> String {
+    // Match `postgres[ql]://user:pass@` and replace `pass` with `***`.
+    // Keep it simple and robust: operate on the whole message.
+    let mut out = String::with_capacity(message.len());
+    let bytes = message.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if message[i..].to_ascii_lowercase().starts_with("postgres") {
+            // Look for `://` after `postgres` or `postgresql`.
+            let rest = &message[i..];
+            let scheme_len = if rest.to_ascii_lowercase().starts_with("postgresql://") {
+                13
+            } else if rest.to_ascii_lowercase().starts_with("postgres://") {
+                11
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            };
+            // Find the end of this URL (next whitespace or end of string).
+            let url_end = message[i..]
+                .char_indices()
+                .skip(scheme_len)
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(idx, _)| i + idx)
+                .unwrap_or(message.len());
+            let url = &message[i..url_end];
+            out.push_str(&redact_url_password(url));
+            i = url_end;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replace the password in a single URL with `***`, if present.
+fn redact_url_password(url: &str) -> String {
+    // Split on `://`, then on the first `@` in the authority.
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some(at_idx) = rest.find('@') else {
+        return url.to_string(); // no userinfo
+    };
+    let userinfo = &rest[..at_idx];
+    let host_and_path = &rest[at_idx..]; // includes the '@'
+    let Some((user, _password)) = userinfo.split_once(':') else {
+        return url.to_string(); // no password
+    };
+    format!("{scheme}://{user}:***{host_and_path}")
+}
+
 /// `fluers version`
 pub(crate) fn version() -> anyhow::Result<()> {
     println!("fluers {}", env!("CARGO_PKG_VERSION"));
@@ -71,8 +128,10 @@ pub(crate) struct RunArgs {
     pub sessions_dir: Option<PathBuf>,
     /// Postgres connection URL for session persistence (e.g.
     /// `postgres://user:pass@host:5432/db`). When set, sessions are persisted
-    /// to Postgres instead of JSON files.
-    #[arg(long)]
+    /// to Postgres instead of JSON files. Falls back to the
+    /// `FLUERS_DATABASE_URL` environment variable so credentials need not
+    /// appear in shell history / `ps` output.
+    #[arg(long, env = "FLUERS_DATABASE_URL")]
     pub database_url: Option<String>,
     /// List persisted session ids and exit.
     #[arg(long, default_value_t = false)]
@@ -99,8 +158,9 @@ pub(crate) struct DevArgs {
     #[arg(long)]
     pub sessions_dir: Option<PathBuf>,
     /// Postgres connection URL for session persistence. When set, dev-server
-    /// sessions are persisted to Postgres instead of JSON files.
-    #[arg(long)]
+    /// sessions are persisted to Postgres instead of JSON files. Falls back to
+    /// the `FLUERS_DATABASE_URL` environment variable.
+    #[arg(long, env = "FLUERS_DATABASE_URL")]
     pub database_url: Option<String>,
     /// Disable all tools (text-only agent).
     #[arg(long, default_value_t = false)]
@@ -203,7 +263,10 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             Arc::new(
                 fluers_postgres::PostgresAdapter::connect(url)
                     .await
-                    .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?,
+                    .map_err(|e| {
+                        let msg = redact_postgres_url(&e.to_string());
+                        anyhow::anyhow!("postgres connect failed: {msg}")
+                    })?,
             )
         } else {
             let sessions_dir = merged.sessions_dir.clone().unwrap_or_else(|| {
@@ -429,7 +492,10 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
             Arc::new(
                 fluers_postgres::PostgresAdapter::connect(url)
                     .await
-                    .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?,
+                    .map_err(|e| {
+                        let msg = redact_postgres_url(&e.to_string());
+                        anyhow::anyhow!("postgres connect failed: {msg}")
+                    })?,
             )
         } else {
             let sessions_dir = args.sessions_dir.clone().unwrap_or_else(|| {
@@ -472,4 +538,58 @@ pub(crate) fn build() -> anyhow::Result<()> {
 pub(crate) async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     println!("✓ deploy → {} (stub — MVP 3.5)", args.target);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{redact_postgres_url, redact_url_password};
+
+    #[test]
+    fn redact_url_password_replaces_password() {
+        let url = "postgres://alice:hunter2@localhost:5432/fluers";
+        assert_eq!(
+            redact_url_password(url),
+            "postgres://alice:***@localhost:5432/fluers"
+        );
+    }
+
+    #[test]
+    fn redact_url_password_keeps_url_without_password() {
+        assert_eq!(
+            redact_url_password("postgres://localhost:5432/fluers"),
+            "postgres://localhost:5432/fluers"
+        );
+        assert_eq!(
+            redact_url_password("postgres://alice@localhost:5432/fluers"),
+            "postgres://alice@localhost:5432/fluers"
+        );
+    }
+
+    #[test]
+    fn redact_postgres_url_redacts_embedded_url() {
+        let msg = "error connecting: postgres://bob:secret@db.example.com:5432/prod";
+        let redacted = redact_postgres_url(msg);
+        assert!(
+            redacted.contains("bob:***@db.example.com"),
+            "got: {redacted}"
+        );
+        assert!(!redacted.contains("secret"), "password leaked: {redacted}");
+    }
+
+    #[test]
+    fn redact_postgres_url_handles_postgresql_scheme() {
+        let msg = "bad url: postgresql://u:p@h:5432/d?sslmode=disable done";
+        let redacted = redact_postgres_url(msg);
+        assert!(redacted.contains("u:***@h:5432"), "got: {redacted}");
+        assert!(
+            redacted.ends_with(" done"),
+            "trailing text lost: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_postgres_url_leaves_non_postgres_text_intact() {
+        let msg = "some other error: no url here";
+        assert_eq!(redact_postgres_url(msg), msg);
+    }
 }

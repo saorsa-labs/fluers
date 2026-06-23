@@ -62,8 +62,9 @@ ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()";
 /// Read one session's data.
 const SELECT_SQL: &str = "SELECT data::text AS data FROM fluers_sessions WHERE id = $1";
 
-/// List all session ids (ordered for deterministic output).
-const LIST_SQL: &str = "SELECT id FROM fluers_sessions ORDER BY id ASC";
+/// List all session ids (ordered for deterministic output). A defensive cap
+/// is applied so an unbounded store cannot exhaust process memory on read.
+const LIST_SQL: &str = "SELECT id FROM fluers_sessions ORDER BY id ASC LIMIT 100000";
 
 /// Advisory-lock key used to serialize schema creation across concurrent
 /// `connect()` calls. Postgres `CREATE TABLE IF NOT EXISTS` is **not** atomic
@@ -202,12 +203,17 @@ mod tests {
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Read the test URL, or skip the test by returning `Ok(None)`.
+    /// Read the test URL, or skip the test by returning `Ok(None)`. An empty
+    /// string is treated as unset so a misconfigured CI var can't trigger a
+    /// surprise network attempt.
     ///
     /// Each test uses a unique UUID-derived session id for isolation, so tests
     /// can run in parallel against a single shared table without interfering.
     async fn adapter_or_skip() -> TestResult<Option<PostgresAdapter>> {
-        let Ok(url) = std::env::var("FLUERS_POSTGRES_TEST_URL") else {
+        let url = std::env::var("FLUERS_POSTGRES_TEST_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let Some(url) = url else {
             return Ok(None);
         };
         Ok(Some(PostgresAdapter::connect(&url).await?))
