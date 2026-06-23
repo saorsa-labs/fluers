@@ -81,6 +81,128 @@ pub trait TurnSink: Send + Sync {
     async fn after_turn(&self, turn: usize, messages: &[AgentMessage]) -> Result<()>;
 }
 
+/// A [`TurnSink`] that fans a turn out to multiple inner sinks, **in order**.
+///
+/// `run_agent` accepts only one `Option<&dyn TurnSink>`. When two concerns
+/// both need per-turn observation (e.g. `SessionRunner` for persistence and
+/// a memory sink for semantic recall), wrap them in a `FanoutTurnSink`. The
+/// sinks are awaited sequentially: sink *N* completes before sink *N+1* runs.
+///
+/// Error semantics: the first sink to return `Err` aborts the remaining
+/// sinks and propagates. Sinks that should be **fail-open** (never break the
+/// run on their own errors — e.g. an optional memory store) must swallow their
+/// own errors inside [`TurnSink::after_turn`] rather than returning `Err`.
+///
+/// Construct with [`FanoutTurnSink::new`] / [`FanoutTurnSink::push`].
+pub struct FanoutTurnSink {
+    sinks: Vec<Box<dyn TurnSink>>,
+}
+
+impl FanoutTurnSink {
+    /// Create an empty fanout sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { sinks: Vec::new() }
+    }
+
+    /// Append an inner sink. Sinks run in insertion order.
+    #[must_use]
+    pub fn push(mut self, sink: Box<dyn TurnSink>) -> Self {
+        self.sinks.push(sink);
+        self
+    }
+
+    /// Number of inner sinks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sinks.len()
+    }
+
+    /// Whether there are no inner sinks.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
+    }
+}
+
+impl Default for FanoutTurnSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnSink for FanoutTurnSink {
+    async fn after_turn(&self, turn: usize, messages: &[AgentMessage]) -> Result<()> {
+        for sink in &self.sinks {
+            sink.after_turn(turn, messages).await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A sink that records every call and optionally fails.
+    struct RecordingSink {
+        calls: Arc<Mutex<Vec<usize>>>,
+        fail_at: Option<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnSink for RecordingSink {
+        async fn after_turn(&self, turn: usize, _messages: &[AgentMessage]) -> Result<()> {
+            self.calls.lock().expect("lock poisoned").push(turn);
+            if self.fail_at == Some(turn) {
+                return Err(crate::error::CoreError::Transport(format!(
+                    "injected failure at turn {turn}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_calls_sinks_in_order() {
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        let fanout = FanoutTurnSink::new()
+            .push(Box::new(RecordingSink {
+                calls: calls_a.clone(),
+                fail_at: None,
+            }))
+            .push(Box::new(RecordingSink {
+                calls: calls_b.clone(),
+                fail_at: None,
+            }));
+        TurnSink::after_turn(&fanout, 1, &[]).await.unwrap();
+        assert_eq!(*calls_a.lock().unwrap(), vec![1]);
+        assert_eq!(*calls_b.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn fanout_propagates_error_and_stops() {
+        // First sink fails at turn 2; the second sink must not be called.
+        let calls_a = Arc::new(Mutex::new(Vec::new()));
+        let calls_b = Arc::new(Mutex::new(Vec::new()));
+        let fanout = FanoutTurnSink::new()
+            .push(Box::new(RecordingSink {
+                calls: calls_a.clone(),
+                fail_at: Some(2),
+            }))
+            .push(Box::new(RecordingSink {
+                calls: calls_b.clone(),
+                fail_at: None,
+            }));
+        let _ = TurnSink::after_turn(&fanout, 2, &[]).await;
+        assert_eq!(*calls_a.lock().unwrap(), vec![2]);
+        assert!(calls_b.lock().unwrap().is_empty(), "second sink ran");
+    }
+}
+
 /// Run the agent loop.
 ///
 /// `messages` is seeded by the caller (typically a `System` message followed

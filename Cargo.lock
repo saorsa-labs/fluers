@@ -488,6 +488,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fluers-core",
+ "fluers-memory",
  "fluers-postgres",
  "fluers-providers",
  "fluers-runtime",
@@ -532,6 +533,21 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "fluers-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fluers-core",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

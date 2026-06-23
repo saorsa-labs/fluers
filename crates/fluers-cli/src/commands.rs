@@ -133,6 +133,23 @@ pub(crate) struct RunArgs {
     /// appear in shell history / `ps` output.
     #[arg(long, env = "FLUERS_DATABASE_URL")]
     pub database_url: Option<String>,
+    /// mem0 base URL for semantic long-term memory (e.g.
+    /// `https://api.mem0.ai`). Memory is enabled only when this **and**
+    /// `--memory-user-id` are both set. Falls back to `FLUERS_MEM0_URL`.
+    #[arg(long, env = "FLUERS_MEM0_URL")]
+    pub memory_url: Option<String>,
+    /// mem0 API key (sent as `Authorization: Token <key>`). Falls back to
+    /// `FLUERS_MEM0_API_KEY`.
+    #[arg(long, env = "FLUERS_MEM0_API_KEY")]
+    pub memory_api_key: Option<String>,
+    /// Per-user partition id for semantic memory. Falls back to
+    /// `FLUERS_MEMORY_USER_ID`.
+    #[arg(long, env = "FLUERS_MEMORY_USER_ID")]
+    pub memory_user_id: Option<String>,
+    /// Maximum memories to inject into the system prompt for new sessions
+    /// (default 5).
+    #[arg(long, default_value_t = 5)]
+    pub memory_limit: usize,
     /// List persisted session ids and exit.
     #[arg(long, default_value_t = false)]
     pub list_sessions: bool,
@@ -162,6 +179,20 @@ pub(crate) struct DevArgs {
     /// the `FLUERS_DATABASE_URL` environment variable.
     #[arg(long, env = "FLUERS_DATABASE_URL")]
     pub database_url: Option<String>,
+    /// mem0 base URL for semantic long-term memory. Falls back to
+    /// `FLUERS_MEM0_URL`.
+    #[arg(long, env = "FLUERS_MEM0_URL")]
+    pub memory_url: Option<String>,
+    /// mem0 API key. Falls back to `FLUERS_MEM0_API_KEY`.
+    #[arg(long, env = "FLUERS_MEM0_API_KEY")]
+    pub memory_api_key: Option<String>,
+    /// Per-user partition id for semantic memory. Falls back to
+    /// `FLUERS_MEMORY_USER_ID`.
+    #[arg(long, env = "FLUERS_MEMORY_USER_ID")]
+    pub memory_user_id: Option<String>,
+    /// Maximum memories to inject into the system prompt (default 5).
+    #[arg(long, default_value_t = 5)]
+    pub memory_limit: usize,
     /// Disable all tools (text-only agent).
     #[arg(long, default_value_t = false)]
     pub no_tools: bool,
@@ -173,6 +204,25 @@ pub(crate) struct DeployArgs {
     /// Target platform id (stub).
     #[arg(long, default_value = "cloudflare")]
     pub target: String,
+}
+
+/// Build an optional semantic-memory adapter from the memory flags. Memory is
+/// enabled only when both `--memory-url` and `--memory-user-id` are present.
+/// Returns `Ok(None)` (memory disabled) when either is missing — no error.
+fn build_memory_adapter(
+    args: &RunArgs,
+) -> anyhow::Result<Option<Arc<dyn fluers_memory::MemoryAdapter>>> {
+    let (Some(url), Some(user_id)) = (&args.memory_url, &args.memory_user_id) else {
+        if args.memory_url.is_some() != args.memory_user_id.is_some() {
+            eprintln!("→ memory disabled: both --memory-url and --memory-user-id are required");
+        }
+        return Ok(None);
+    };
+    let _ = user_id; // used later by the sink; adapter construction only needs url + key.
+    let api_key = args.memory_api_key.clone().unwrap_or_default();
+    let adapter = fluers_memory::Mem0RestAdapter::new(url, api_key)
+        .map_err(|e| anyhow::anyhow!("memory adapter setup failed: {e}"))?;
+    Ok(Some(Arc::new(adapter)))
 }
 
 /// Resolve a provider from the chosen backend.
@@ -250,6 +300,10 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         session: args.session.clone(),
         sessions_dir: args.sessions_dir.clone(),
         database_url: args.database_url.clone(),
+        memory_url: args.memory_url.clone(),
+        memory_api_key: args.memory_api_key.clone(),
+        memory_user_id: args.memory_user_id.clone(),
+        memory_limit: args.memory_limit,
         list_sessions: false,
     };
 
@@ -314,6 +368,12 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     let loaded = fluers_runtime::SessionRunner::load(adapter.clone(), session_id).await?;
     let resuming = loaded.is_some();
 
+    // Build the optional semantic-memory adapter. Memory is enabled only when
+    // both URL and user id are configured. The adapter is built once and shared
+    // between the injection search (new sessions) and the per-turn sink.
+    let memory_adapter: Option<Arc<dyn fluers_memory::MemoryAdapter>> =
+        build_memory_adapter(&merged)?;
+
     let (model_id, max_turns, system_message, mut messages) = match loaded {
         Some(ref r) => {
             let mut msgs = r.messages();
@@ -333,8 +393,43 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             )
         }
         None => {
-            let system = "You are a Fluers agent. Use the provided tools when they help. \
-                          Paths are relative to the working directory. Be concise.";
+            let mut system = String::from(
+                "You are a Fluers agent. Use the provided tools when they help. \
+                 Paths are relative to the working directory. Be concise.",
+            );
+            // Memory injection — NEW sessions only. For resumed sessions, the
+            // persisted system message is used unchanged (exact replay wins).
+            if let Some(adapter) = &memory_adapter {
+                let prompt = merged
+                    .prompt
+                    .clone()
+                    .unwrap_or_else(|| "No prompt given.".to_string());
+                match adapter
+                    .search(&fluers_memory::MemorySearchRequest {
+                        user_id: merged
+                            .memory_user_id
+                            .clone()
+                            .unwrap_or_else(|| "default".into()),
+                        query: prompt,
+                        top_k: merged.memory_limit,
+                    })
+                    .await
+                {
+                    Ok(memories) => {
+                        let block = fluers_memory::format_memories(&memories);
+                        if !block.is_empty() {
+                            system.push_str("\n\n");
+                            system.push_str(&block);
+                            eprintln!(
+                                "→ injected {} memory(ies) into system prompt",
+                                memories.len()
+                            );
+                        }
+                    }
+                    // Fail-open: injection failure is logged and skipped.
+                    Err(e) => eprintln!("→ memory search failed (ignored): {e}"),
+                }
+            }
             let prompt = merged
                 .prompt
                 .clone()
@@ -343,7 +438,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
                 AgentMessage {
                     role: Role::System,
                     content: vec![ContentBlock::Text {
-                        text: system.into(),
+                        text: system.clone(),
                     }],
                 },
                 AgentMessage {
@@ -358,7 +453,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
                     .unwrap_or("minimax/minimax-m3")
                     .to_string(),
                 merged.max_turns.unwrap_or(12),
-                Some(system.to_string()),
+                Some(system),
                 msgs,
             )
         }
@@ -376,7 +471,24 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             system_message,
         ),
     };
-    let runner_ref: &dyn fluers_core::TurnSink = &runner;
+
+    // Build the effective TurnSink: always fan out through persistence (the
+    // runner), and — when memory is configured — append a fail-open memory
+    // sink. The persistence sink runs first so a memory outage cannot affect
+    // persistence ordering.
+    let mut sink = fluers_core::FanoutTurnSink::new().push(Box::new(runner));
+    if let Some(memory_adapter) = memory_adapter.as_ref() {
+        let memory_sink = fluers_memory::MemoryTurnSink::new(
+            memory_adapter.clone(),
+            merged
+                .memory_user_id
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+        );
+        sink = sink.push(Box::new(memory_sink));
+        eprintln!("→ semantic memory enabled (per-turn extraction)");
+    }
+    let sink_ref: &dyn fluers_core::TurnSink = &sink;
 
     let model = Model::new(&model_id);
     let config = RunConfig {
@@ -424,7 +536,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             &config,
             &cancel,
             &mut on_event,
-            Some(runner_ref),
+            Some(sink_ref),
         )
         .await
         .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
@@ -445,7 +557,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         &model,
         &config,
         &cancel,
-        Some(runner_ref),
+        Some(sink_ref),
     )
     .await
     .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
@@ -474,6 +586,10 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         session: None,
         sessions_dir: None,
         database_url: None,
+        memory_url: None,
+        memory_api_key: None,
+        memory_user_id: None,
+        memory_limit: 5,
         list_sessions: false,
     })?;
     let workdir = args
