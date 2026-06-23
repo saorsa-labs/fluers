@@ -350,6 +350,7 @@ dependencies = [
  "async-trait",
  "fluers-runtime",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

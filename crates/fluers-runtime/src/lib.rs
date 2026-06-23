@@ -39,7 +39,7 @@ pub mod tool;
 pub use agent::{define_agent, Agent, AgentProfile, AgentSpec};
 pub use env::{Limits, SessionEnv};
 pub use error::{RuntimeError, RuntimeResult};
-pub use event::{Event, EventSubscriber};
+pub use event::{Event, EventBus};
 pub use json_file_adapter::JsonFileAdapter;
 pub use local_env::LocalSessionEnv;
 pub use persistence::PersistenceAdapter;
