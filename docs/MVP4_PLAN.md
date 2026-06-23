@@ -19,7 +19,7 @@ all such tests are gated behind environment variables.
 
 ## Slices
 
-### 4a — Postgres persistence ✅ (target: first)
+### 4a — Postgres persistence ✅ (target: first) — **DONE**
 
 **Crate:** `fluers-postgres` (already scaffolded as a stub).
 
@@ -42,6 +42,19 @@ all such tests are gated behind environment variables.
 **Exit criteria:** a session saved via `PostgresAdapter` round-trips and
 resumes through the existing `SessionStore::load`; `--list-sessions` works
 against the Postgres-backed store.
+
+> **Met (live-verified against Postgres 16.14):** 6/6 adapter + SessionStore
+> tests pass (incl. a full save→load→list resume through `SessionStore`, a
+> 256 KiB JSONB payload, and an upsert). 3× repeated parallel runs confirm
+> the concurrency fix holds. CLI `--database-url` persists + resumes a session
+> through Postgres; `--list-sessions` lists it; the DB shows a single row
+> (upsert verified). All workspace tests (52) stay green without a DB (the
+> postgres tests skip cleanly when `FLUERS_POSTGRES_TEST_URL` is unset).
+>
+> **Concurrency fix:** concurrent `CREATE TABLE IF NOT EXISTS` races on
+> Postgres's type-name catalog (`pg_type_typname_nsp_index`). Schema creation
+> is now serialized with a transaction-scoped `pg_advisory_xact_lock`, making
+> multi-worker boot safe.
 
 ---
 

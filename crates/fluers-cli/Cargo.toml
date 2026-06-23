@@ -20,6 +20,7 @@ fluers-core.workspace = true
 fluers-runtime.workspace = true
 fluers-providers.workspace = true
 fluers-server.workspace = true
+fluers-postgres.workspace = true
 uuid.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -18,3 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+fluers-core.workspace = true

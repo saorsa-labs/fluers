@@ -66,8 +66,14 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub session: Option<String>,
     /// Directory for JSON session files (default: `~/.fluers/sessions`).
+    /// Ignored when `--database-url` is set.
     #[arg(long)]
     pub sessions_dir: Option<PathBuf>,
+    /// Postgres connection URL for session persistence (e.g.
+    /// `postgres://user:pass@host:5432/db`). When set, sessions are persisted
+    /// to Postgres instead of JSON files.
+    #[arg(long)]
+    pub database_url: Option<String>,
     /// List persisted session ids and exit.
     #[arg(long, default_value_t = false)]
     pub list_sessions: bool,
@@ -178,19 +184,29 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         config: None,
         session: args.session.clone(),
         sessions_dir: args.sessions_dir.clone(),
+        database_url: args.database_url.clone(),
         list_sessions: false,
     };
 
     // ── Session persistence setup ──────────────────────────────────────────
-    // Resolve the sessions directory (default ~/.fluers/sessions) and build a
-    // JSON-file adapter. `--list-sessions` is handled here, before provider/env
-    // setup, so it works without an API key.
-    let sessions_dir = merged.sessions_dir.clone().unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".fluers").join("sessions")
-    });
+    // Resolve the persistence adapter. `--database-url` selects a Postgres
+    // backend; otherwise JSON files under the sessions directory are used.
+    // `--list-sessions` is handled here, before provider/env setup, so it
+    // works without an API key.
     let adapter: Arc<dyn fluers_runtime::PersistenceAdapter> =
-        Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir));
+        if let Some(url) = merged.database_url.as_ref() {
+            Arc::new(
+                fluers_postgres::PostgresAdapter::connect(url)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?,
+            )
+        } else {
+            let sessions_dir = merged.sessions_dir.clone().unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".fluers").join("sessions")
+            });
+            Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir))
+        };
 
     if args.list_sessions {
         let ids = adapter
@@ -389,6 +405,7 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         config: None,
         session: None,
         sessions_dir: None,
+        database_url: None,
         list_sessions: false,
     })?;
     let workdir = args
