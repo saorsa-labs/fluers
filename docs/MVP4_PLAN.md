@@ -116,7 +116,7 @@ persistence adapter.
 
 ---
 
-### 4d — MCP tool adapter
+### 4d — MCP tool adapter — **DONE**
 
 **Crate:** `fluers-mcp` (scaffolded as a stub).
 

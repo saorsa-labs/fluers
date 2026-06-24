@@ -245,3 +245,36 @@ creep). Defer to a follow-up.
 
 HTTP/SSE transports, resources, prompts, sampling, auth, and multi-server CLI
 config are explicitly deferred. See `MVP4_PLAN.md`.
+
+## Accepted risks (post-review, documented)
+
+The following were flagged by the 4d adversarial review and assessed as
+**accepted** for the stdio-MVP scope (with cheap DoS bounds added where noted):
+
+- **Result-size cap (added):** `format_mcp_result` truncates total output at
+  `MCP_MAX_RESULT_CHARS` (256 KB) to prevent a server streaming a
+  multi-gigabyte text result. Marked with `…(result truncated)`.
+- **Tool-count cap (added):** `discover_tools` stops at
+  `MCP_MAX_TOOLS_PER_SERVER` (256) tools to prevent an unbounded `tools/list`.
+- **Prompt injection via tool description (accepted):** the server-controlled
+  original tool name and description are forwarded into the model-facing
+  `ToolDefinition` verbatim. This is inherent to MCP (servers describe their
+  tools to models); Flue does not sanitize this either. Mitigating prompt
+  injection is the EventBus / memory layer's concern, not the tool adapter's.
+- **`kill_on_drop` honoring (accepted, best-effort):** `kill_on_drop(true)` is
+  set on the child `Command`, but the subprocess is ultimately reaped by
+  `rmcp`'s `ChildWithCleanup::drop` / process exit. An explicit awaited
+  `McpServer::close()` is deferred. The child cannot detach across process
+  exit.
+- **Cancellation notification (accepted, deferred):** when `ctx.cancel` fires
+  mid-`tools/call`, the in-flight future is dropped but no MCP
+  `CancelledNotification` is sent, so the server may continue working. This is
+  explicitly out of scope for the MVP (documented above).
+- **Mock server unbounded I/O (accepted):** `fluers-mcp-mock-server` is a
+  test-only artifact; it reads unbounded lines and echoes without a size cap.
+  Not a production surface.
+- **Tool errors are model-visible, not run-fatal (confirmed safe):** the
+  runner converts a tool `Err` into a model-visible tool-result message (it
+  does NOT fail the run), so a flaky MCP server surfaces an error to the model
+  and the run continues — same as local tools. Error strings are bounded to
+  200 chars (`bound_error`).

@@ -47,6 +47,16 @@ use fluers_core::tool::{
 /// out of telemetry). Mirrors the 4c `run_failed` truncation fix.
 pub const MCP_ERROR_SUMMARY_MAX_CHARS: usize = 200;
 
+/// Maximum total characters produced by [`format_mcp_result`]. A misbehaving
+/// or malicious server could otherwise stream a multi-gigabyte text result and
+/// exhaust agent memory. Real tool output rarely exceeds a few hundred KB.
+pub const MCP_MAX_RESULT_CHARS: usize = 256 * 1024;
+
+/// Maximum number of tools accepted from a single server during discovery.
+/// Guards against a server that returns an unbounded `tools/list` (paginated or
+/// otherwise). No legitimate server advertises anywhere near this many.
+pub const MCP_MAX_TOOLS_PER_SERVER: usize = 256;
+
 /// Truncate a string to [`MCP_ERROR_SUMMARY_MAX_CHARS`], appending an ellipsis.
 fn bound_error(msg: impl AsRef<str>) -> String {
     let s = msg.as_ref();
@@ -209,11 +219,20 @@ pub fn format_mcp_result(result: &CallToolResult) -> String {
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let joined = joined.trim();
+    let mut joined = joined.trim().to_string();
+    // Bound the total result size (DoS guard: a server could otherwise stream
+    // a multi-gigabyte text result and exhaust agent memory).
+    if joined.len() > MCP_MAX_RESULT_CHARS {
+        joined = format!(
+            "{}…(result truncated at {} chars)",
+            &joined[..MCP_MAX_RESULT_CHARS],
+            MCP_MAX_RESULT_CHARS
+        );
+    }
     if joined.is_empty() {
         "(MCP tool returned no content)".to_string()
     } else {
-        joined.to_string()
+        joined
     }
 }
 
@@ -324,6 +343,14 @@ async fn discover_tools(
         .map_err(|e| McpError::protocol(format!("tools/list: {e}")))?;
 
         for tool in page.tools {
+            if all.len() >= MCP_MAX_TOOLS_PER_SERVER {
+                tracing::warn!(
+                    "MCP server \"{}\" exceeded the {}-tool discovery cap; ignoring the rest",
+                    cfg.name,
+                    MCP_MAX_TOOLS_PER_SERVER
+                );
+                return Ok(all);
+            }
             let mcp_name = tool.name.to_string();
             let adapted = adapted_tool_name(&cfg.name, &mcp_name);
             if !seen_names.insert(adapted.clone()) {
@@ -607,6 +634,22 @@ mod tests {
         // format_mcp_result itself doesn't add the Error: prefix — that's the
         // execute() path's job. Here we just confirm the text body is surfaced.
         assert_eq!(format_mcp_result(&result), "disk full");
+    }
+
+    #[test]
+    fn format_truncates_oversized_result() {
+        use rmcp::model::{CallToolResult, Content};
+        // A server streaming far past the cap must be truncated (DoS guard).
+        let huge = "y".repeat(MCP_MAX_RESULT_CHARS * 2);
+        let result = CallToolResult::success(vec![Content::text(huge)]);
+        let out = format_mcp_result(&result);
+        assert!(out.len() < MCP_MAX_RESULT_CHARS * 2, "not truncated");
+        assert!(out.contains("…(result truncated at"));
+        // The retained prefix is exactly the cap.
+        assert_eq!(
+            &out[..MCP_MAX_RESULT_CHARS],
+            &"y".repeat(MCP_MAX_RESULT_CHARS)
+        );
     }
 
     #[test]
