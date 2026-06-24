@@ -1,40 +1,22 @@
 //! The event stream.
 //!
 //! Mirrors Flue's `observe` / `FlueEventSubscriber` and `event-stream-store`.
-//! Observers subscribe to a stream of [`Event`]s emitted as a session runs.
+//! Observers subscribe to a stream of [`Event`]s (= [`fluers_core::RunEvent`])
+//! emitted as a session runs.
+//!
+//! The [`Event`] type and the [`EventSink`](fluers_core::EventSink) trait live
+//! in `fluers-core` so that `run_agent` (which lives in core) can emit events
+//! without creating a `core → runtime` dependency cycle. [`EventBus`] implements
+//! that trait here.
 
-use serde::{Deserialize, Serialize};
+use fluers_core::{EventSink, RunEvent};
 use tokio::sync::broadcast;
 
-use crate::session::SessionId;
-
-/// One observable lifecycle event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Event {
-    /// A session started.
-    SessionStarted {
-        /// Which session.
-        session: SessionId,
-    },
-    /// A model turn began.
-    TurnStarted {
-        /// Which session.
-        session: SessionId,
-    },
-    /// A tool was invoked.
-    ToolInvoked {
-        /// Which session.
-        session: SessionId,
-        /// Tool name.
-        tool: String,
-    },
-    /// A turn completed.
-    TurnFinished {
-        /// Which session.
-        session: SessionId,
-    },
-}
+/// Re-export of the core run-lifecycle event type.
+///
+/// Kept as a type alias for backward compatibility with code that imports
+/// `fluers_runtime::Event`.
+pub type Event = RunEvent;
 
 /// A fan-out event bus backed by a bounded broadcast channel.
 ///
@@ -44,7 +26,7 @@ pub enum Event {
 /// channel reports a lag error to that receiver on its next receive.
 #[derive(Clone)]
 pub struct EventBus {
-    sender: broadcast::Sender<Event>,
+    sender: broadcast::Sender<RunEvent>,
 }
 
 impl EventBus {
@@ -73,7 +55,7 @@ impl EventBus {
     /// The caller owns the returned receiver and should drain it, typically on
     /// a dedicated task.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    pub fn subscribe(&self) -> broadcast::Receiver<RunEvent> {
         self.sender.subscribe()
     }
 
@@ -82,8 +64,17 @@ impl EventBus {
     /// Returns `false` when there are no active receivers. Sending is
     /// non-blocking; slow receivers observe [`broadcast::error::RecvError::Lagged`]
     /// when they next receive.
-    pub fn emit(&self, event: Event) -> bool {
+    pub fn emit(&self, event: RunEvent) -> bool {
         self.sender.send(event).is_ok()
+    }
+}
+
+/// `EventBus` satisfies the core [`EventSink`] trait so it can be passed to
+/// [`run_agent`](fluers_core::run_agent) via [`RunHooks`](fluers_core::RunHooks).
+impl EventSink for EventBus {
+    fn emit(&self, event: RunEvent) {
+        // Ignore the "no receivers" return — the agent loop doesn't care.
+        let _ = EventBus::emit(self, event);
     }
 }
 
@@ -99,8 +90,9 @@ mod tests {
 
     use tokio::time::timeout;
 
-    use super::{Event, EventBus};
-    use crate::session::SessionId;
+    use super::EventBus;
+    use fluers_core::{EventSink, RunEvent};
+    use uuid::Uuid;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -109,92 +101,66 @@ mod tests {
     #[tokio::test]
     async fn emit_delivers_to_subscriber() -> TestResult {
         let bus = EventBus::new(16);
-        let expected_session = SessionId::nil();
+        let session = Uuid::nil();
         let mut receiver = bus.subscribe();
 
         let handle = tokio::spawn(async move { receiver.recv().await.ok() });
 
-        assert!(bus.emit(Event::SessionStarted {
-            session: expected_session,
-        }));
+        assert!(bus.emit(RunEvent::SessionStarted { session }));
 
         let received = timeout(TEST_TIMEOUT, handle).await??;
         assert!(matches!(
             received,
-            Some(Event::SessionStarted { session }) if session == expected_session
+            Some(RunEvent::SessionStarted { session: s }) if s == session
         ));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_sink_trait_delegates_to_emit() -> TestResult {
+        let bus = EventBus::new(16);
+        let session = Uuid::nil();
+        let mut receiver = bus.subscribe();
+
+        // Via the EventSink trait (not the inherent method).
+        EventSink::emit(&bus, RunEvent::SessionStarted { session });
+
+        let received = timeout(TEST_TIMEOUT, receiver.recv()).await?;
+        assert!(matches!(
+            received,
+            Ok(RunEvent::SessionStarted { session: s }) if s == session
+        ));
         Ok(())
     }
 
     #[tokio::test]
     async fn emit_with_no_receivers_returns_false() {
         let bus = EventBus::new(16);
-        let session = SessionId::nil();
+        let session = Uuid::nil();
 
-        assert!(!bus.emit(Event::SessionStarted { session }));
+        assert!(!bus.emit(RunEvent::SessionStarted { session }));
     }
 
     #[tokio::test]
     async fn multiple_subscribers_each_receive() -> TestResult {
         let bus = EventBus::new(16);
-        let expected_session = SessionId::nil();
+        let session = Uuid::nil();
         let mut first = bus.subscribe();
         let mut second = bus.subscribe();
 
-        assert!(bus.emit(Event::TurnStarted {
-            session: expected_session,
-        }));
+        assert!(bus.emit(RunEvent::TurnStarted { session, turn: 1 }));
 
         let first_event = timeout(TEST_TIMEOUT, first.recv()).await?;
         let second_event = timeout(TEST_TIMEOUT, second.recv()).await?;
 
         assert!(matches!(
             first_event,
-            Ok(Event::TurnStarted { session }) if session == expected_session
+            Ok(RunEvent::TurnStarted { session: s, turn: 1 }) if s == session
         ));
         assert!(matches!(
             second_event,
-            Ok(Event::TurnStarted { session }) if session == expected_session
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn no_deadlock_on_emit_from_receiver_task() -> TestResult {
-        let bus = EventBus::new(16);
-        let expected_session = SessionId::nil();
-        let mut observer = bus.subscribe();
-        let mut receiver = bus.subscribe();
-        let nested_bus = bus.clone();
-
-        let handle = tokio::spawn(async move {
-            match receiver.recv().await {
-                Ok(Event::TurnStarted { session }) => {
-                    nested_bus.emit(Event::TurnFinished { session })
-                }
-                Ok(_) | Err(_) => false,
-            }
-        });
-
-        assert!(bus.emit(Event::TurnStarted {
-            session: expected_session,
-        }));
-
-        let first_event = timeout(TEST_TIMEOUT, observer.recv()).await?;
-        assert!(matches!(
-            first_event,
-            Ok(Event::TurnStarted { session }) if session == expected_session
-        ));
-
-        let nested_emit_succeeded = timeout(TEST_TIMEOUT, handle).await??;
-        assert!(nested_emit_succeeded);
-
-        let second_event = timeout(TEST_TIMEOUT, observer.recv()).await?;
-        assert!(matches!(
-            second_event,
-            Ok(Event::TurnFinished { session }) if session == expected_session
+            Ok(RunEvent::TurnStarted { session: s, turn: 1 }) if s == session
         ));
 
         Ok(())

@@ -22,6 +22,7 @@ fluers-providers.workspace = true
 fluers-server.workspace = true
 fluers-postgres.workspace = true
 fluers-memory.workspace = true
+fluers-otel.workspace = true
 uuid.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -517,6 +517,7 @@ dependencies = [
  "clap",
  "fluers-core",
  "fluers-memory",
+ "fluers-otel",
  "fluers-postgres",
  "fluers-providers",
  "fluers-runtime",

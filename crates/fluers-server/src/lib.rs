@@ -140,7 +140,12 @@ async fn invoke(
 
     let model = fluers_core::Model::new(&handle.model.id);
     let cancel = tokio_util::sync::CancellationToken::new();
-    let runner_ref: &dyn fluers_core::TurnSink = runner.as_ref();
+    let event_bus = fluers_runtime::EventBus::new_default();
+    let hooks = fluers_core::RunHooks {
+        session_id: Some(session_id),
+        turn_sink: Some(runner.as_ref()),
+        event_sink: Some(&event_bus),
+    };
     let outcome = run_agent(
         handle.provider.as_ref(),
         &handle.tools,
@@ -148,7 +153,7 @@ async fn invoke(
         &model,
         &handle.config,
         &cancel,
-        Some(runner_ref),
+        &hooks,
     )
     .await
     .map_err(map_err)?;
@@ -202,7 +207,12 @@ async fn stream(
     let cancel = tokio_util::sync::CancellationToken::new();
 
     tokio::spawn(async move {
-        let runner_ref: &dyn fluers_core::TurnSink = runner.as_ref();
+        let event_bus = fluers_runtime::EventBus::new_default();
+        let hooks = fluers_core::RunHooks {
+            session_id: Some(session_id),
+            turn_sink: Some(runner.as_ref()),
+            event_sink: Some(&event_bus),
+        };
         let mut on_event = |ev: &StreamEvent| {
             let sse = match ev {
                 StreamEvent::TextDelta(t) => SseEvent::TextDelta { text: t.clone() },
@@ -221,7 +231,7 @@ async fn stream(
             &config,
             &cancel,
             &mut on_event,
-            Some(runner_ref),
+            &hooks,
         )
         .await;
         match result {

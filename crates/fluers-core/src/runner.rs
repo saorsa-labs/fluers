@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{CoreError, Result};
+use crate::event::{RunEvent, RunHooks};
 use crate::message::{AgentMessage, ContentBlock, Role};
 use crate::model::{Model, ModelProvider, ModelRequest, StreamEvent};
 use crate::thinking::ThinkingLevel;
@@ -227,20 +228,34 @@ pub async fn run_agent(
     model: &Model,
     config: &RunConfig,
     cancel: &CancellationToken,
-    on_turn: Option<&dyn TurnSink>,
+    hooks: &RunHooks<'_>,
 ) -> Result<RunOutcome> {
+    hooks.emit_event(|sid| RunEvent::SessionStarted { session: sid });
     let mut turns = 0usize;
     loop {
         if cancel.is_cancelled() {
+            hooks.emit_event(|sid| RunEvent::RunFailed {
+                session: sid,
+                error: "cancelled".into(),
+            });
             return Err(CoreError::Cancelled("agent run cancelled".into()));
         }
         if turns >= config.max_turns {
-            return Err(CoreError::ModelResponse(format!(
+            let msg = format!(
                 "max_turns ({}) exceeded — the model kept calling tools",
                 config.max_turns
-            )));
+            );
+            hooks.emit_event(|sid| RunEvent::RunFailed {
+                session: sid,
+                error: msg.clone(),
+            });
+            return Err(CoreError::ModelResponse(msg));
         }
         turns += 1;
+        hooks.emit_event(|sid| RunEvent::TurnStarted {
+            session: sid,
+            turn: turns,
+        });
 
         let request = ModelRequest {
             model: model.clone(),
@@ -249,9 +264,27 @@ pub async fn run_agent(
             thinking: config.thinking,
             params: Default::default(),
         };
+        hooks.emit_event(|sid| RunEvent::ModelStarted {
+            session: sid,
+            turn: turns,
+            model: model.id.clone(),
+        });
         // Compose the per-turn timeout with the caller's cancellation token.
         let response =
-            invoke_with_budget(provider, request, config.turn_timeout_ms, cancel).await?;
+            match invoke_with_budget(provider, request, config.turn_timeout_ms, cancel).await {
+                Ok(r) => r,
+                Err(e) => {
+                    hooks.emit_event(|sid| RunEvent::RunFailed {
+                        session: sid,
+                        error: e.to_string(),
+                    });
+                    return Err(e);
+                }
+            };
+        hooks.emit_event(|sid| RunEvent::ModelFinished {
+            session: sid,
+            turn: turns,
+        });
         // Snapshot this turn's tool calls *before* moving the messages into history.
         let tool_calls: Vec<(String, ToolCall)> = response
             .messages
@@ -272,26 +305,55 @@ pub async fn run_agent(
             // No tool calls ⇒ the model finished. Extract final text.
             let final_text = extract_final_text(messages);
             // Notify the sink so the final state is persisted before returning.
-            if let Some(sink) = on_turn {
+            if let Some(sink) = hooks.turn_sink {
                 sink.after_turn(turns, messages).await?;
             }
+            hooks.emit_event(|sid| RunEvent::TurnFinished {
+                session: sid,
+                turn: turns,
+            });
             return Ok(RunOutcome { turns, final_text });
         }
 
         // Reject runaway responses before executing anything.
         if tool_calls.len() > config.max_tool_calls_per_turn {
-            return Err(CoreError::ModelResponse(format!(
+            let msg = format!(
                 "model issued {} tool calls in one turn (max {})",
                 tool_calls.len(),
                 config.max_tool_calls_per_turn
-            )));
+            );
+            hooks.emit_event(|sid| RunEvent::RunFailed {
+                session: sid,
+                error: msg.clone(),
+            });
+            return Err(CoreError::ModelResponse(msg));
+        }
+
+        // Emit ToolStarted for each call, then execute.
+        for (id, call) in &tool_calls {
+            hooks.emit_event(|sid| RunEvent::ToolStarted {
+                session: sid,
+                turn: turns,
+                tool: call.name.clone(),
+                call_id: id.clone(),
+            });
         }
 
         // Execute the turn's tool calls (sequential or bounded-parallel) and
         // append a Tool message per call, in the original order.
         let results = execute_tool_calls(tools, &tool_calls, cancel, config.tool_concurrency).await;
-        for (i, (id, _call)) in tool_calls.iter().enumerate() {
+
+        // Emit ToolFinished and append tool-result messages.
+        for (i, (id, call)) in tool_calls.iter().enumerate() {
             let result = &results[i];
+            let ok = tool_result_ok(result);
+            hooks.emit_event(|sid| RunEvent::ToolFinished {
+                session: sid,
+                turn: turns,
+                tool: call.name.clone(),
+                call_id: id.clone(),
+                ok,
+            });
             let tool_msg = AgentMessage {
                 role: Role::Tool,
                 content: vec![ContentBlock::ToolResult {
@@ -305,9 +367,13 @@ pub async fn run_agent(
         // End of turn: notify the sink so the coordinator can persist/observe
         // before the next turn begins. Persistence of turn N must complete
         // before turn N+1 starts — this is what makes resume-after-kill faithful.
-        if let Some(sink) = on_turn {
+        if let Some(sink) = hooks.turn_sink {
             sink.after_turn(turns, messages).await?;
         }
+        hooks.emit_event(|sid| RunEvent::TurnFinished {
+            session: sid,
+            turn: turns,
+        });
     }
 }
 
@@ -371,20 +437,34 @@ pub async fn run_agent_streaming(
     config: &RunConfig,
     cancel: &CancellationToken,
     on_event: &mut (dyn FnMut(&StreamEvent) + Send),
-    on_turn: Option<&dyn TurnSink>,
+    hooks: &RunHooks<'_>,
 ) -> Result<RunOutcome> {
+    hooks.emit_event(|sid| RunEvent::SessionStarted { session: sid });
     let mut turns = 0usize;
     loop {
         if cancel.is_cancelled() {
+            hooks.emit_event(|sid| RunEvent::RunFailed {
+                session: sid,
+                error: "cancelled".into(),
+            });
             return Err(CoreError::Cancelled("agent run cancelled".into()));
         }
         if turns >= config.max_turns {
-            return Err(CoreError::ModelResponse(format!(
+            let msg = format!(
                 "max_turns ({}) exceeded — the model kept calling tools",
                 config.max_turns
-            )));
+            );
+            hooks.emit_event(|sid| RunEvent::RunFailed {
+                session: sid,
+                error: msg.clone(),
+            });
+            return Err(CoreError::ModelResponse(msg));
         }
         turns += 1;
+        hooks.emit_event(|sid| RunEvent::TurnStarted {
+            session: sid,
+            turn: turns,
+        });
 
         let request = ModelRequest {
             model: model.clone(),
@@ -393,9 +473,27 @@ pub async fn run_agent_streaming(
             thinking: config.thinking,
             params: Default::default(),
         };
+        hooks.emit_event(|sid| RunEvent::ModelStarted {
+            session: sid,
+            turn: turns,
+            model: model.id.clone(),
+        });
         // Stream the turn, reassembling into an assistant message + tool calls.
         let stream = provider.stream(request);
-        let turn = collect_streamed_turn(stream, on_event).await?;
+        let turn = match collect_streamed_turn(stream, on_event).await {
+            Ok(t) => t,
+            Err(e) => {
+                hooks.emit_event(|sid| RunEvent::RunFailed {
+                    session: sid,
+                    error: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+        hooks.emit_event(|sid| RunEvent::ModelFinished {
+            session: sid,
+            turn: turns,
+        });
 
         // Build the assistant message from the reassembled turn.
         let mut content: Vec<ContentBlock> = Vec::new();
@@ -416,24 +514,54 @@ pub async fn run_agent_streaming(
         if turn.tool_calls.is_empty() {
             let final_text = extract_final_text(messages);
             // Notify the sink so the final state is persisted before returning.
-            if let Some(sink) = on_turn {
+            if let Some(sink) = hooks.turn_sink {
                 sink.after_turn(turns, messages).await?;
             }
+            hooks.emit_event(|sid| RunEvent::TurnFinished {
+                session: sid,
+                turn: turns,
+            });
             return Ok(RunOutcome { turns, final_text });
         }
         if turn.tool_calls.len() > config.max_tool_calls_per_turn {
-            return Err(CoreError::ModelResponse(format!(
+            let msg = format!(
                 "model issued {} tool calls in one turn (max {})",
                 turn.tool_calls.len(),
                 config.max_tool_calls_per_turn
-            )));
+            );
+            hooks.emit_event(|sid| RunEvent::RunFailed {
+                session: sid,
+                error: msg.clone(),
+            });
+            return Err(CoreError::ModelResponse(msg));
         }
 
         let owned_calls: Vec<(String, ToolCall)> = turn.tool_calls.clone();
+
+        // Emit ToolStarted for each call, then execute.
+        for (id, call) in &owned_calls {
+            hooks.emit_event(|sid| RunEvent::ToolStarted {
+                session: sid,
+                turn: turns,
+                tool: call.name.clone(),
+                call_id: id.clone(),
+            });
+        }
+
         let results =
             execute_tool_calls(tools, &owned_calls, cancel, config.tool_concurrency).await;
-        for (i, (id, _call)) in owned_calls.iter().enumerate() {
+
+        // Emit ToolFinished and append tool-result messages.
+        for (i, (id, call)) in owned_calls.iter().enumerate() {
             let result = &results[i];
+            let ok = tool_result_ok(result);
+            hooks.emit_event(|sid| RunEvent::ToolFinished {
+                session: sid,
+                turn: turns,
+                tool: call.name.clone(),
+                call_id: id.clone(),
+                ok,
+            });
             let tool_msg = AgentMessage {
                 role: Role::Tool,
                 content: vec![ContentBlock::ToolResult {
@@ -445,9 +573,13 @@ pub async fn run_agent_streaming(
             messages.push(tool_msg);
         }
         // End of turn: notify the sink (see `run_agent` for rationale).
-        if let Some(sink) = on_turn {
+        if let Some(sink) = hooks.turn_sink {
             sink.after_turn(turns, messages).await?;
         }
+        hooks.emit_event(|sid| RunEvent::TurnFinished {
+            session: sid,
+            turn: turns,
+        });
     }
 }
 
@@ -602,6 +734,17 @@ fn error_result(message: &str) -> ToolResult {
     }
 }
 
+/// Heuristic: a [`ToolResult`] is "ok" unless any text block starts with
+/// `"Error:"`. This matches the [`error_result`] convention. (A future
+/// refactor should add an explicit `ok` field to `ToolResult`.)
+fn tool_result_ok(result: &ToolResult) -> bool {
+    !result.content.iter().any(|c| {
+        c.get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with("Error:"))
+    })
+}
+
 /// Concatenate the text blocks of the last assistant message in `messages`.
 fn extract_final_text(messages: &[AgentMessage]) -> String {
     messages
@@ -742,7 +885,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await
         .expect("loop should complete");
@@ -777,7 +920,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await
         .expect("loop should complete");
@@ -805,7 +948,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await
         .expect("loop should recover");
@@ -834,7 +977,7 @@ mod tests {
                 ..RunConfig::default()
             },
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await;
 
@@ -858,7 +1001,7 @@ mod tests {
             &model,
             &RunConfig::default(),
             &cancel,
-            None,
+            &RunHooks::default(),
         )
         .await;
 
@@ -917,7 +1060,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await;
 
@@ -949,7 +1092,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await;
 
@@ -1029,7 +1172,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await
         .expect("loop should complete");
@@ -1106,7 +1249,7 @@ mod tests {
             &model,
             &config,
             &CancellationToken::new(),
-            None,
+            &RunHooks::default(),
         )
         .await
         .expect("loop must survive a tool panic");
@@ -1125,6 +1268,157 @@ mod tests {
             tool_ids,
             vec!["c1", "c2"],
             "both results must be present despite the panic: {tool_ids:?}"
+        );
+    }
+
+    // ── Event emission tests (MVP 4c) ──
+
+    use crate::event::{EventSink, RunEvent};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    /// A recording sink that collects every emitted event.
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<RunEvent>>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: RunEvent) {
+            self.events.lock().expect("lock poisoned").push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_only_run_emits_complete_event_sequence() {
+        let provider = MockProvider::new(vec![vec![assistant_text("hello")]]);
+        let tools: Vec<Arc<dyn Tool>> = vec![];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("hi")];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let hooks = RunHooks {
+            session_id: Some(Uuid::nil()),
+            turn_sink: None,
+            event_sink: Some(&RecordingSink {
+                events: sink.clone(),
+            } as &dyn EventSink),
+        };
+
+        run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &RunConfig::default(),
+            &CancellationToken::new(),
+            &hooks,
+        )
+        .await
+        .expect("run");
+
+        let events = sink.lock().expect("lock poisoned").clone();
+        // Text-only turn: Session → Turn → Model(S/F) → TurnFinished
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::SessionStarted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::TurnStarted { turn: 1, .. })));
+        assert!(events.iter().any(
+            |e| matches!(e, RunEvent::ModelStarted { turn: 1, model, .. } if model == "mock/test")
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::ModelFinished { turn: 1, .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::TurnFinished { turn: 1, .. })));
+        // No tool events for a text-only turn.
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RunEvent::ToolStarted { .. })));
+    }
+
+    #[tokio::test]
+    async fn tool_run_emits_tool_started_finished() {
+        let echo_tool = Arc::new(EchoTool) as Arc<dyn Tool>;
+        let tools = vec![echo_tool.clone()];
+        let provider = MockProvider::new(vec![
+            vec![assistant_tool_use(
+                "call-1",
+                "echo",
+                json!({ "text": "hi" }),
+            )],
+            vec![assistant_text("done")],
+        ]);
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("echo hi")];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let hooks = RunHooks {
+            session_id: Some(Uuid::nil()),
+            turn_sink: None,
+            event_sink: Some(&RecordingSink {
+                events: sink.clone(),
+            } as &dyn EventSink),
+        };
+
+        run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &RunConfig::default(),
+            &CancellationToken::new(),
+            &hooks,
+        )
+        .await
+        .expect("run");
+
+        let events = sink.lock().expect("lock poisoned").clone();
+        // Turn 1 has a tool call → ToolStarted then ToolFinished.
+        assert!(
+            events.iter().any(|e| matches!(e, RunEvent::ToolStarted { turn: 1, tool, call_id, .. } if tool == "echo" && call_id == "call-1")),
+            "missing ToolStarted for echo/call-1"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, RunEvent::ToolFinished { turn: 1, tool, call_id, ok: true, .. } if tool == "echo" && call_id == "call-1")),
+            "missing ToolFinished for echo/call-1"
+        );
+        // Two turns (tool then text).
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::TurnFinished { turn: 2, .. })));
+    }
+
+    #[tokio::test]
+    async fn no_events_when_session_id_is_none() {
+        let provider = MockProvider::new(vec![vec![assistant_text("hello")]]);
+        let tools: Vec<Arc<dyn Tool>> = vec![];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("hi")];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let hooks = RunHooks {
+            session_id: None, // no session → no events
+            turn_sink: None,
+            event_sink: Some(&RecordingSink {
+                events: sink.clone(),
+            } as &dyn EventSink),
+        };
+
+        run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &RunConfig::default(),
+            &CancellationToken::new(),
+            &hooks,
+        )
+        .await
+        .expect("run");
+
+        assert!(
+            sink.lock().expect("lock poisoned").is_empty(),
+            "events emitted with no session_id"
         );
     }
 }

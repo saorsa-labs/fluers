@@ -501,7 +501,19 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         sink = sink.push(Box::new(memory_sink));
         eprintln!("→ semantic memory enabled (per-turn extraction)");
     }
-    let sink_ref: &dyn fluers_core::TurnSink = &sink;
+    // Construct an EventBus for observability and spawn a tracing subscriber.
+    // When all senders (the bus) drop, the subscriber task exits cleanly.
+    let event_bus = fluers_runtime::EventBus::new_default();
+    let _otel_handle = fluers_otel::tracing_subscriber(&event_bus);
+    let event_sink: &dyn fluers_core::EventSink = &event_bus;
+
+    // Build the effective RunHooks: session id, persistence/memory turn sink,
+    // and the event sink for observability.
+    let hooks = fluers_core::RunHooks {
+        session_id: Some(session_id),
+        turn_sink: Some(&sink as &dyn fluers_core::TurnSink),
+        event_sink: Some(event_sink),
+    };
 
     let model = Model::new(&model_id);
     let config = RunConfig {
@@ -549,7 +561,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             &config,
             &cancel,
             &mut on_event,
-            Some(sink_ref),
+            &hooks,
         )
         .await
         .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
@@ -570,7 +582,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         &model,
         &config,
         &cancel,
-        Some(sink_ref),
+        &hooks,
     )
     .await
     .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
