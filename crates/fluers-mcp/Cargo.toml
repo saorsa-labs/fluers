@@ -18,3 +18,15 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+rmcp.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio-util.workspace = true
+
+# Mock stdio MCP server, built so the hermetic integration test can spawn it
+# as a real subprocess (no Node/Docker/network). Not intended for users.
+[[bin]]
+name = "fluers-mcp-mock-server"
+path = "bin/mock_server.rs"
+
