@@ -30,6 +30,7 @@ pub mod message;
 mod message_tests;
 pub mod model;
 pub mod runner;
+pub mod subagent;
 pub mod thinking;
 pub mod tool;
 
