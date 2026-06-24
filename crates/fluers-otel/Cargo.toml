@@ -12,8 +12,16 @@ description = "OpenTelemetry tracing adapter for Fluers"
 workspace = true
 
 [dependencies]
+fluers-core.workspace = true
 fluers-runtime.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["http-proto"] }
+uuid.workspace = true
+
+[dev-dependencies]
+# No OTLP collector needed for tests.

@@ -26,7 +26,7 @@ enum Command {
     /// Run an agent locally (MVP: prints the resolved profile).
     Run(Box<commands::RunArgs>),
     /// Start the dev server (stub).
-    Dev(commands::DevArgs),
+    Dev(Box<commands::DevArgs>),
     /// Build agents for deployment (stub).
     Build,
     /// Deploy to a hosted runtime (stub).
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Version => commands::version(),
         Command::Run(args) => commands::run(*args).await,
-        Command::Dev(args) => commands::dev(args).await,
+        Command::Dev(args) => commands::dev(*args).await,
         Command::Build => commands::build(),
         Command::Deploy(args) => commands::deploy(args).await,
     }?;

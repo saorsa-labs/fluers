@@ -150,6 +150,12 @@ pub(crate) struct RunArgs {
     /// (default 5).
     #[arg(long, default_value_t = 5)]
     pub memory_limit: usize,
+    /// OTLP collector endpoint for OpenTelemetry span export (e.g.
+    /// `http://localhost:4318/v1/traces`). When set, spans are exported via
+    /// OTLP; otherwise events are logged via tracing. Falls back to
+    /// `FLUERS_OTEL_ENDPOINT`.
+    #[arg(long, env = "FLUERS_OTEL_ENDPOINT")]
+    pub otel_endpoint: Option<String>,
     /// List persisted session ids and exit.
     #[arg(long, default_value_t = false)]
     pub list_sessions: bool,
@@ -193,6 +199,10 @@ pub(crate) struct DevArgs {
     /// Maximum memories to inject into the system prompt (default 5).
     #[arg(long, default_value_t = 5)]
     pub memory_limit: usize,
+    /// OTLP collector endpoint for OpenTelemetry span export. Falls back to
+    /// `FLUERS_OTEL_ENDPOINT`.
+    #[arg(long, env = "FLUERS_OTEL_ENDPOINT")]
+    pub otel_endpoint: Option<String>,
     /// Disable all tools (text-only agent).
     #[arg(long, default_value_t = false)]
     pub no_tools: bool,
@@ -317,6 +327,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         memory_api_key: args.memory_api_key.clone(),
         memory_user_id: args.memory_user_id.clone(),
         memory_limit: args.memory_limit,
+        otel_endpoint: args.otel_endpoint.clone(),
         list_sessions: false,
     };
 
@@ -501,10 +512,26 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         sink = sink.push(Box::new(memory_sink));
         eprintln!("→ semantic memory enabled (per-turn extraction)");
     }
-    // Construct an EventBus for observability and spawn a tracing subscriber.
-    // When all senders (the bus) drop, the subscriber task exits cleanly.
+    // Construct an EventBus for observability. When an OTLP endpoint is
+    // configured, spawn the OTLP exporter; otherwise use tracing.
     let event_bus = fluers_runtime::EventBus::new_default();
-    let _otel_handle = fluers_otel::tracing_subscriber(&event_bus);
+    let _otel_provider: Option<fluers_otel::SdkTracerProvider> =
+        if let Some(endpoint) = &merged.otel_endpoint {
+            match fluers_otel::otlp_subscriber(&event_bus, endpoint) {
+                Ok((_handle, provider)) => {
+                    eprintln!("→ OTLP tracing enabled: {endpoint}");
+                    Some(provider)
+                }
+                Err(e) => {
+                    eprintln!("→ OTLP setup failed (falling back to tracing): {e}");
+                    let _tracing = fluers_otel::tracing_subscriber(&event_bus);
+                    None
+                }
+            }
+        } else {
+            let _tracing = fluers_otel::tracing_subscriber(&event_bus);
+            None
+        };
     let event_sink: &dyn fluers_core::EventSink = &event_bus;
 
     // Build the effective RunHooks: session id, persistence/memory turn sink,
@@ -615,6 +642,7 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         memory_api_key: None,
         memory_user_id: None,
         memory_limit: 5,
+        otel_endpoint: None,
         list_sessions: false,
     })?;
     let workdir = args
