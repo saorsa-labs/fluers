@@ -93,7 +93,7 @@ persistence adapter.
 
 ---
 
-### 4c — Observability (event emission + OTel)
+### 4c — Observability (event emission + OTel) — **DONE**
 
 **Crates:** touches `fluers-core` (event emission only), `fluers-otel` (new).
 
