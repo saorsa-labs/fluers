@@ -141,7 +141,7 @@ server (e.g. the filesystem reference server).
 
 ---
 
-### 4f — Subagent delegation & depth limits
+### 4f — Subagent delegation & depth limits — **DONE**
 
 **Last** — depends on stable persistence + observability seams (4a, 4c).
 

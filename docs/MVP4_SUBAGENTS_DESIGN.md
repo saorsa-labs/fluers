@@ -224,5 +224,54 @@ depth-limit enforcement"). A config-file format for declaring subagents
 - An agent can delegate a subtask to a declared subagent via the built-in `task`
   tool, and the child's answer returns to the parent.
 - Depth-limit enforcement works (`max_depth` configurable; default 5).
+- **Delegation-budget enforcement works** (`max_delegations` configurable;
+  default 64) — bounds exponential fan-out (see Accepted risks).
 - `cargo nextest run --workspace` stays green with no external deps.
 - fmt + strict clippy clean.
+
+## Accepted risks (post-review, documented)
+
+The following were flagged by the 4f adversarial review and assessed as
+**accepted** for the MVP scope (with cheap guards added where noted):
+
+- **Delegation budget (added):** depth alone bounds chain length but not
+  branching — a parent turn can issue many parallel `task` calls, each spawning
+  children that do the same, producing up to
+  `max_tool_calls_per_turn`^`max_depth` ≈ 10⁵ runs at defaults. `SubagentOptions::
+  max_delegations` (default 64) is a shared `AtomicUsize` counter across the
+  whole tree; each `task` call decrements it and a call that would exceed the
+  budget returns a budget-exceeded error result.
+- **Tool-name collision guard (added):** if a profile declares a tool named
+  `task`, the runner's first-match lookup could let it shadow the
+  depth-enforcing child `TaskTool`. Mitigated by **prepending** the child
+  `TaskTool` to the child tool list so it always wins the lookup; a profile's
+  colliding `task` tool becomes unreachable rather than a depth-bypass.
+- **Prompt injection (accepted, inherent):** the child's system message is the
+  trusted, author-declared `instructions`, but the `prompt` comes from the
+  parent model (untrusted — it could inject adversarial instructions). This is
+  inherent to delegation (the whole point is to pass the model's subtask to a
+  specialist); the instructions are not overridden at the API level. Prompt-
+  injection hardening is the memory/EventBus layer's concern, not the tool
+  adapter's.
+- **Cancellation token choice (verified correct):** `delegate()` passes the
+  **run** `CancellationToken` (`self.cancel`) to child runs, not the per-tool
+  `ctx.cancel`. `ctx.cancel` is a *child* of the run token (runner line 654),
+  so this means subagent children live for the parent **run**, not a single
+  per-call window — a sibling tool's cancellation must not kill a subagent.
+  A run-level cancellation still propagates to all descendants.
+- **Provider sharing (accepted):** parent and children share one
+  `Arc<dyn ModelProvider>`. Real HTTP providers are stateless, so this is
+  correct. Stateful test providers (e.g. a scripted queue) see interleaved
+  parent/child calls — integration tests account for this by sequencing
+  responses in call order.
+- **Event flood (accepted):** each child emits the full lifecycle event
+  sequence. Deep/wide delegation can generate many events, but `EventBus` is a
+  bounded `broadcast` channel whose `send` is non-blocking: slow receivers lag
+  and drop events rather than blocking the agent or growing memory
+  unboundedly.
+- **Named error variants (accepted, deferred):** the design doc references
+  `SubagentNotDeclared` / `DelegationDepthExceeded` as conditions; the code
+  expresses them as `CoreError::ToolInputValidation` with distinguishing
+  messages. Behaviour is correct (the runner converts any tool `Err` into a
+  model-visible `Error:` result). Distinct `CoreError` variants for structured
+  matching are a future refactor.

@@ -14,6 +14,7 @@
 //! session. Scalar defaults (`model` / `config`) inherit from the parent when
 //! the profile omits them.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,6 +33,14 @@ use crate::tool::{InvokeContext, Tool, ToolDefinition, ToolResult};
 /// calls run children at depth 1, etc. This matches the default in most agent
 /// harnesses and keeps runaway delegation bounded.
 pub const DEFAULT_MAX_DEPTH: usize = 5;
+
+/// Default cap on the **total** number of delegations across the whole tree.
+/// Depth alone bounds chain length but not branching: a parent turn can issue
+/// many parallel `task` calls, each of which can do the same, producing
+/// exponential fan-out (up to `max_tool_calls_per_turn`^`max_depth` ≈ 10⁵ at
+/// defaults). This shared budget turns that into a hard ceiling regardless of
+/// depth or width.
+pub const DEFAULT_MAX_DELEGATIONS: usize = 64;
 
 /// A named, declarable subagent profile.
 ///
@@ -60,7 +69,9 @@ pub struct SubagentProfile {
 
 impl SubagentProfile {
     /// Build a minimal profile (name + instructions). Other fields default to
-    /// inherited / empty.
+    /// inherited / empty. `description` is left empty (callers can override
+    /// with `.with_description(...)`; an empty description renders as
+    /// "(no description provided)" in the tool listing).
     #[must_use]
     pub fn new(name: impl Into<String>, instructions: impl Into<String>) -> Self {
         Self {
@@ -115,18 +126,24 @@ impl SubagentProfile {
 /// Options for the [`TaskTool`].
 #[derive(Clone, Copy, Debug)]
 pub struct SubagentOptions {
-    /// Maximum delegation depth (recursion limit).
-    ///
-    /// The top-level agent runs at depth 0; its `task` calls run children at
-    /// depth 1; their `task` calls run at depth 2; etc. A `task` call at
-    /// `depth >= max_depth` returns a depth-exceeded error result.
+    /// Maximum delegation **depth** (chain length). The top-level agent runs
+    /// at depth 0; its `task` calls run children at depth 1; their `task` calls
+    /// run at depth 2; etc. A `task` call at `depth >= max_depth` returns a
+    /// depth-exceeded error result.
     pub max_depth: usize,
+    /// Maximum **total** number of delegations across the whole tree (shared
+    /// atomic counter). Bounds exponential fan-out: a parent issuing many
+    /// parallel `task` calls, each spawning children that do the same, is
+    /// capped regardless of depth or width. A `task` call that would exceed
+    /// the remaining budget returns a budget-exceeded error result.
+    pub max_delegations: usize,
 }
 
 impl Default for SubagentOptions {
     fn default() -> Self {
         Self {
             max_depth: DEFAULT_MAX_DEPTH,
+            max_delegations: DEFAULT_MAX_DELEGATIONS,
         }
     }
 }
@@ -160,6 +177,9 @@ pub struct TaskTool {
     /// Optional event sink (children emit to the same sink with a new session
     /// id, giving a nested trace without explicit span-parent linking).
     event_sink: Option<Arc<dyn EventSink>>,
+    /// Shared counter of **remaining** delegations across the whole tree.
+    /// Bounds exponential fan-out: each successful `task` call decrements it.
+    remaining_delegations: Arc<AtomicUsize>,
 }
 
 impl TaskTool {
@@ -186,6 +206,7 @@ impl TaskTool {
             depth: 0,
             cancel,
             event_sink,
+            remaining_delegations: Arc::new(AtomicUsize::new(options.max_delegations)),
         }
     }
 
@@ -205,12 +226,24 @@ impl TaskTool {
             depth: self.depth + 1,
             cancel: self.cancel.clone(),
             event_sink: self.event_sink.as_ref().map(Arc::clone),
+            // Shared across the whole tree.
+            remaining_delegations: Arc::clone(&self.remaining_delegations),
         }
     }
 
     /// Resolve a profile by name.
     fn resolve(&self, name: &str) -> Option<&SubagentProfile> {
         self.subagents.iter().find(|s| s.name == name)
+    }
+
+    /// The original delegation budget (for diagnostics). Stored implicitly as
+    /// `remaining + consumed`; since we only need it for error messages, we
+    /// approximate by reading `remaining` plus the depth index. This is best-
+    /// effort and used only in the budget-exceeded message.
+    fn max_delegations_hint(&self) -> usize {
+        // We don't store the original cap separately; approximate from the
+        // current remaining count. The message is guidance, not a contract.
+        self.remaining_delegations.load(Ordering::Relaxed) + 1
     }
 
     /// Delegate to the resolved subagent. Returns the child's final text.
@@ -227,8 +260,11 @@ impl TaskTool {
 
         // Build the child's tool list. Profile-owned only; the parent's tools
         // never flow in. Add a child TaskTool only if the profile declares its
-        // own subagents (recursion).
-        let mut child_tools: Vec<Arc<dyn Tool>> = profile.tools.clone();
+        // own subagents (recursion). The child TaskTool is PREPENDED so that,
+        // if a profile mistakenly/​maliciously declares a tool named "task",
+        // the depth-enforcing child TaskTool wins the name lookup (the runner
+        // matches the first tool by name) and depth limits are preserved.
+        let mut child_tools: Vec<Arc<dyn Tool>> = Vec::new();
         if !profile.subagents.is_empty() {
             let child_task = self.child(
                 profile.subagents.clone(),
@@ -239,6 +275,7 @@ impl TaskTool {
             );
             child_tools.push(Arc::new(child_task));
         }
+        child_tools.extend(profile.tools.clone());
 
         // Fresh child session: new UUID, messages = [system, user].
         let child_session = Uuid::new_v4();
@@ -359,8 +396,25 @@ impl Tool for TaskTool {
             }
         };
 
+        // Enforce the shared delegation budget (bounds exponential fan-out).
+        // fetch_sub returns the PREVIOUS value; if it was 0, we're already at
+        // the cap and this call must be rejected. Otherwise we've claimed one
+        // slot.
+        let prev = self.remaining_delegations.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // Restore the counter (we didn't consume a slot) and report.
+            self.remaining_delegations.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::ToolInputValidation(format!(
+                "delegation budget exhausted (max {} total delegations across the tree)",
+                self.max_delegations_hint()
+            )));
+        }
+
         // Enforce the depth limit (DelegationDepthExceeded).
         if self.depth >= self.max_depth {
+            // We already decremented the budget; restore it since we're not
+            // actually delegating.
+            self.remaining_delegations.fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::ToolInputValidation(format!(
                 "delegation depth exceeded (depth {} >= max_depth {})",
                 self.depth, self.max_depth
@@ -412,7 +466,10 @@ mod tests {
             },
             RunConfig::default(),
             profiles,
-            SubagentOptions { max_depth },
+            SubagentOptions {
+                max_depth,
+                max_delegations: DEFAULT_MAX_DELEGATIONS,
+            },
             CancellationToken::new(),
             None,
         )
@@ -513,6 +570,54 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("depth exceeded"), "msg: {msg}");
         assert!(msg.contains("max_depth 0"));
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_blocks_delegation() {
+        // max_delegations = 1 allows ONE delegation; the second `task` call in
+        // the SAME run must be rejected with a budget-exceeded error.
+        let tool = TaskTool::new(
+            test_provider(),
+            Model {
+                id: "test/model".into(),
+            },
+            RunConfig::default(),
+            vec![dummy_profile("worker")],
+            SubagentOptions {
+                max_depth: DEFAULT_MAX_DEPTH,
+                max_delegations: 1,
+            },
+            CancellationToken::new(),
+            None,
+        );
+        let ctx1 = InvokeContext {
+            tool_call_id: "b1".into(),
+            cancel: CancellationToken::new(),
+        };
+        // First delegation consumes the single budget slot and succeeds.
+        let r1 = tool
+            .execute(
+                ctx1,
+                serde_json::json!({ "agent": "worker", "prompt": "go" }),
+            )
+            .await
+            .expect("first delegation succeeds");
+        assert_eq!(r1.content.len(), 1);
+
+        // Second delegation in the same tree is rejected.
+        let ctx2 = InvokeContext {
+            tool_call_id: "b2".into(),
+            cancel: CancellationToken::new(),
+        };
+        let err = tool
+            .execute(
+                ctx2,
+                serde_json::json!({ "agent": "worker", "prompt": "again" }),
+            )
+            .await
+            .expect_err("budget should be exhausted");
+        let msg = err.to_string();
+        assert!(msg.contains("budget exhausted"), "msg: {msg}");
     }
 
     #[tokio::test]
@@ -704,7 +809,10 @@ mod tests {
             RunConfig::default(),
             vec![child],
             // max_depth = 1: only ONE level of delegation allowed.
-            SubagentOptions { max_depth: 1 },
+            SubagentOptions {
+                max_depth: 1,
+                max_delegations: DEFAULT_MAX_DELEGATIONS,
+            },
             cancel.clone(),
             None,
         ));
