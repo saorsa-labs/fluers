@@ -234,10 +234,7 @@ pub async fn run_agent(
     let mut turns = 0usize;
     loop {
         if cancel.is_cancelled() {
-            hooks.emit_event(|sid| RunEvent::RunFailed {
-                session: sid,
-                error: "cancelled".into(),
-            });
+            hooks.emit_event(|sid| crate::event::run_failed(sid, "cancelled"));
             return Err(CoreError::Cancelled("agent run cancelled".into()));
         }
         if turns >= config.max_turns {
@@ -245,10 +242,7 @@ pub async fn run_agent(
                 "max_turns ({}) exceeded — the model kept calling tools",
                 config.max_turns
             );
-            hooks.emit_event(|sid| RunEvent::RunFailed {
-                session: sid,
-                error: msg.clone(),
-            });
+            hooks.emit_event(|sid| crate::event::run_failed(sid, msg.clone()));
             return Err(CoreError::ModelResponse(msg));
         }
         turns += 1;
@@ -274,10 +268,7 @@ pub async fn run_agent(
             match invoke_with_budget(provider, request, config.turn_timeout_ms, cancel).await {
                 Ok(r) => r,
                 Err(e) => {
-                    hooks.emit_event(|sid| RunEvent::RunFailed {
-                        session: sid,
-                        error: e.to_string(),
-                    });
+                    hooks.emit_event(|sid| crate::event::run_failed(sid, e.to_string()));
                     return Err(e);
                 }
             };
@@ -322,10 +313,7 @@ pub async fn run_agent(
                 tool_calls.len(),
                 config.max_tool_calls_per_turn
             );
-            hooks.emit_event(|sid| RunEvent::RunFailed {
-                session: sid,
-                error: msg.clone(),
-            });
+            hooks.emit_event(|sid| crate::event::run_failed(sid, msg.clone()));
             return Err(CoreError::ModelResponse(msg));
         }
 
@@ -443,10 +431,7 @@ pub async fn run_agent_streaming(
     let mut turns = 0usize;
     loop {
         if cancel.is_cancelled() {
-            hooks.emit_event(|sid| RunEvent::RunFailed {
-                session: sid,
-                error: "cancelled".into(),
-            });
+            hooks.emit_event(|sid| crate::event::run_failed(sid, "cancelled"));
             return Err(CoreError::Cancelled("agent run cancelled".into()));
         }
         if turns >= config.max_turns {
@@ -454,10 +439,7 @@ pub async fn run_agent_streaming(
                 "max_turns ({}) exceeded — the model kept calling tools",
                 config.max_turns
             );
-            hooks.emit_event(|sid| RunEvent::RunFailed {
-                session: sid,
-                error: msg.clone(),
-            });
+            hooks.emit_event(|sid| crate::event::run_failed(sid, msg.clone()));
             return Err(CoreError::ModelResponse(msg));
         }
         turns += 1;
@@ -483,10 +465,7 @@ pub async fn run_agent_streaming(
         let turn = match collect_streamed_turn(stream, on_event).await {
             Ok(t) => t,
             Err(e) => {
-                hooks.emit_event(|sid| RunEvent::RunFailed {
-                    session: sid,
-                    error: e.to_string(),
-                });
+                hooks.emit_event(|sid| crate::event::run_failed(sid, e.to_string()));
                 return Err(e);
             }
         };
@@ -529,10 +508,7 @@ pub async fn run_agent_streaming(
                 turn.tool_calls.len(),
                 config.max_tool_calls_per_turn
             );
-            hooks.emit_event(|sid| RunEvent::RunFailed {
-                session: sid,
-                error: msg.clone(),
-            });
+            hooks.emit_event(|sid| crate::event::run_failed(sid, msg.clone()));
             return Err(CoreError::ModelResponse(msg));
         }
 

@@ -16,7 +16,6 @@
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use fluers_core::RunEvent;
 use fluers_runtime::EventBus;
@@ -175,6 +174,9 @@ impl SpanState {
                 }
             }
             RunEvent::RunFailed { error, .. } => {
+                // End any open turn/tool spans BEFORE the root so the trace
+                // stays well-formed (parents must outlive children).
+                self.flush_children();
                 if let Some(mut span) = self.root.take() {
                     span.add_event("run.failed", vec![KeyValue::new("error", error)]);
                     span.end();
@@ -183,27 +185,35 @@ impl SpanState {
         }
     }
 
-    /// End all remaining spans (called on subscriber exit).
-    fn flush(&mut self) {
+    /// End all remaining open child spans (tools + turns), but leave the
+    /// root span open. Called on [`RunEvent::RunFailed`] before the root ends
+    /// so the trace stays well-formed.
+    fn flush_children(&mut self) {
         for (_, mut span) in self.tools.drain() {
             span.end();
         }
         for (_, mut span) in self.turns.drain() {
             span.end();
         }
+    }
+
+    /// End all remaining spans (called on subscriber exit).
+    fn flush(&mut self) {
+        self.flush_children();
         if let Some(mut span) = self.root.take() {
             span.end();
         }
     }
 }
 
-/// Force-flush pending spans in the provider, with a timeout.
+/// Force-flush pending spans in the provider.
 ///
 /// Call this before dropping the provider to avoid losing in-flight spans.
+/// The batch exporter manages its own flush timing internally.
 ///
 /// # Errors
 /// Returns an error string if the flush fails.
-pub fn flush_provider(provider: &SdkTracerProvider, _timeout: Duration) -> Result<(), String> {
+pub fn flush_provider(provider: &SdkTracerProvider) -> Result<(), String> {
     provider
         .force_flush()
         .map_err(|e| format!("flush failed: {e:?}"))
@@ -213,6 +223,7 @@ pub fn flush_provider(provider: &SdkTracerProvider, _timeout: Duration) -> Resul
 mod tests {
     use super::*;
     use fluers_core::RunEvent;
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[tokio::test]

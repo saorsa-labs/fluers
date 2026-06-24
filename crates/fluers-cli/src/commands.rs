@@ -514,8 +514,10 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
     // Construct an EventBus for observability. When an OTLP endpoint is
     // configured, spawn the OTLP exporter; otherwise use tracing.
+    // The provider + handle are held until the end of the run so pending
+    // spans flush before the function returns.
     let event_bus = fluers_runtime::EventBus::new_default();
-    let _otel_provider: Option<fluers_otel::SdkTracerProvider> =
+    let otel_provider: Option<fluers_otel::SdkTracerProvider> =
         if let Some(endpoint) = &merged.otel_endpoint {
             match fluers_otel::otlp_subscriber(&event_bus, endpoint) {
                 Ok((_handle, provider)) => {
@@ -532,6 +534,17 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             let _tracing = fluers_otel::tracing_subscriber(&event_bus);
             None
         };
+    /// Force-flush the OTLP provider (if any) so pending spans export before
+    /// the function returns and the provider drops. Called on both exit paths.
+    macro_rules! flush_otel {
+        () => {
+            if let Some(provider) = &otel_provider {
+                if let Err(e) = fluers_otel::flush_provider(provider) {
+                    eprintln!("→ OTLP flush warning: {e}");
+                }
+            }
+        };
+    }
     let event_sink: &dyn fluers_core::EventSink = &event_bus;
 
     // Build the effective RunHooks: session id, persistence/memory turn sink,
@@ -595,6 +608,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         println!();
         eprintln!("→ done in {} turn(s)", outcome.turns);
         eprintln!("→ session persisted: {session_id}  (resume with --session {session_id})");
+        flush_otel!();
         return Ok(());
     }
 
@@ -617,6 +631,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     eprintln!("→ done in {} turn(s)", outcome.turns);
     eprintln!("→ session persisted: {session_id}  (resume with --session {session_id})");
     println!("{}", outcome.final_text);
+    flush_otel!();
     Ok(())
 }
 

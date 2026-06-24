@@ -80,9 +80,32 @@ pub enum RunEvent {
     RunFailed {
         /// The session id.
         session: Uuid,
-        /// A short error summary (no full error chain / user data).
+        /// A **bounded** error summary. Truncated to keep user content out of
+        /// telemetry: provider/tool response bodies embedded in error strings
+        /// are capped at [`ERROR_SUMMARY_MAX_CHARS`] characters. Use this for
+        /// debugging signal, not as a source of truth about user data.
         error: String,
     },
+}
+
+/// Maximum number of characters retained in a [`RunEvent::RunFailed`] error
+/// summary. Keeps provider/tool response text out of telemetry exports.
+pub const ERROR_SUMMARY_MAX_CHARS: usize = 200;
+
+/// Build a [`RunEvent::RunFailed`] with a bounded error summary, so user-facing
+/// content embedded in error strings does not leak into telemetry.
+#[must_use]
+pub fn run_failed(session: Uuid, error: impl AsRef<str>) -> RunEvent {
+    let error = error.as_ref();
+    let summary = if error.len() > ERROR_SUMMARY_MAX_CHARS {
+        format!("{}…(truncated)", &error[..ERROR_SUMMARY_MAX_CHARS])
+    } else {
+        error.to_string()
+    };
+    RunEvent::RunFailed {
+        session,
+        error: summary,
+    }
 }
 
 /// A sink for [`RunEvent`]s — the dependency-direction seam between
@@ -155,5 +178,41 @@ impl<'a> RunHooks<'a> {
         if let (Some(sid), Some(sink)) = (self.session_id, self.event_sink) {
             sink.emit(make(sid));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_failed_truncates_long_errors() {
+        let long = "x".repeat(ERROR_SUMMARY_MAX_CHARS * 2);
+        let event = run_failed(Uuid::nil(), &long);
+        match event {
+            RunEvent::RunFailed { error, .. } => {
+                assert!(error.len() < long.len(), "error not truncated");
+                assert!(error.ends_with("…(truncated)"));
+            }
+            _ => panic!("expected RunFailed"),
+        }
+    }
+
+    #[test]
+    fn run_failed_preserves_short_errors() {
+        let event = run_failed(Uuid::nil(), "short error");
+        match event {
+            RunEvent::RunFailed { error, .. } => {
+                assert_eq!(error, "short error");
+            }
+            _ => panic!("expected RunFailed"),
+        }
+    }
+
+    #[test]
+    fn run_failed_accepts_string_and_str() {
+        // Both &str and String should work (impl AsRef<str>).
+        let _ = run_failed(Uuid::nil(), "literal");
+        let _ = run_failed(Uuid::nil(), String::from("owned"));
     }
 }
