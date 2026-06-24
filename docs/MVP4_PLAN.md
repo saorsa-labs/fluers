@@ -110,6 +110,10 @@ persistence adapter.
 **Exit criteria:** a `fluers dev` run emits a complete OpenTelemetry trace
 (visible in Jaeger / an OTLP collector) covering model + tool spans.
 
+> **See [`MVP4_OTEL_DESIGN.md`](MVP4_OTEL_DESIGN.md) for the full design: the
+> EventSink seam (solving the core↔runtime dependency cycle), the RunHooks
+> API, and the OTLP exporter + tracing fallback.**
+
 ---
 
 ### 4d — MCP tool adapter
