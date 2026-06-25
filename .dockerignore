@@ -1,0 +1,28 @@
+# Keep the Docker build context lean. See docs/MVP35_BUILD_DEPLOY_DESIGN.md.
+
+# Build artifacts
+target/
+**/target/
+
+# Version control
+.git/
+.gitignore
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Session / runtime data
+sessions/
+.fluers/
+
+# Config that may carry local paths (mount at runtime instead)
+fluers.toml
+
+# Docs don't belong in the image
+docs/
+
+# Research scratch
+*.md.bak

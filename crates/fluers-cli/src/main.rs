@@ -28,9 +28,9 @@ enum Command {
     Run(Box<commands::RunArgs>),
     /// Start the dev server (stub).
     Dev(Box<commands::DevArgs>),
-    /// Build agents for deployment (stub).
-    Build,
-    /// Deploy to a hosted runtime (stub).
+    /// Build the fluers binary (and optionally a Docker image).
+    Build(commands::BuildArgs),
+    /// Deploy to a local Docker runtime.
     Deploy(commands::DeployArgs),
 }
 
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Version => commands::version(),
         Command::Run(args) => commands::run(*args).await,
         Command::Dev(args) => commands::dev(*args).await,
-        Command::Build => commands::build(),
+        Command::Build(args) => commands::build(args),
         Command::Deploy(args) => commands::deploy(args).await,
     }?;
 

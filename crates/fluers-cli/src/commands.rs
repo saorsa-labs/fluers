@@ -213,12 +213,27 @@ pub(crate) struct DevArgs {
     pub no_tools: bool,
 }
 
+/// Args for `build`.
+#[derive(Args, Debug, Default)]
+pub(crate) struct BuildArgs {
+    /// Also build a Docker image after the binary (requires Docker).
+    #[arg(long, default_value_t = false)]
+    pub docker: bool,
+    /// Override the Docker image tag (default `fluers:latest`).
+    #[arg(long)]
+    pub tag: Option<String>,
+}
+
 /// Args for `deploy`.
 #[derive(Args, Debug)]
 pub(crate) struct DeployArgs {
-    /// Target platform id (stub).
-    #[arg(long, default_value = "cloudflare")]
+    /// Target platform. Only `docker` is supported (MVP).
+    #[arg(long, default_value = "docker")]
     pub target: String,
+    /// Trailing args passed to `fluers` inside the container
+    /// (everything after `--`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub passthrough: Vec<String>,
 }
 
 /// Build an optional semantic-memory adapter from the memory flags. Memory is
@@ -746,16 +761,68 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
     fluers_server::serve(addr, state).await
 }
 
-/// `fluers build` (stub).
-pub(crate) fn build() -> anyhow::Result<()> {
-    println!("✓ build (stub — MVP 3.5)");
+/// `fluers build` — build a release binary, optionally a Docker image.
+pub(crate) fn build(args: BuildArgs) -> anyhow::Result<()> {
+    eprintln!("→ building release binary…");
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "--bin", "fluers"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run cargo: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("cargo build failed with status {status}"));
+    }
+    eprintln!("✓ release binary built");
+
+    if args.docker {
+        let tag = args.tag.as_deref().unwrap_or("fluers:latest");
+        ensure_docker()?;
+        eprintln!("→ building Docker image `{tag}`…");
+        let status = std::process::Command::new("docker")
+            .args(["build", "-t", tag, "."])
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run docker: {e}"))?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("docker build failed with status {status}"));
+        }
+        eprintln!("✓ Docker image `{tag}` built");
+    }
     Ok(())
 }
 
-/// `fluers deploy` (stub).
+/// `fluers deploy` — run the built image. Only `--target docker` (MVP).
 pub(crate) async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
-    println!("✓ deploy → {} (stub — MVP 3.5)", args.target);
+    if args.target != "docker" {
+        return Err(anyhow::anyhow!(
+            "unsupported deploy target `{}` (only `docker` is supported in MVP)",
+            args.target
+        ));
+    }
+    ensure_docker()?;
+    eprintln!("→ deploying via Docker…");
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args(["run", "--rm", "-i", "fluers:latest"]);
+    // Pass through any trailing args to fluers inside the container.
+    cmd.args(&args.passthrough);
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run docker: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("docker run failed with status {status}"));
+    }
     Ok(())
+}
+
+/// Check that Docker is available; error clearly if not.
+fn ensure_docker() -> anyhow::Result<()> {
+    let result = std::process::Command::new("docker")
+        .arg("--version")
+        .output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        _ => Err(anyhow::anyhow!(
+            "Docker is not available on PATH. Install Docker or run without --docker."
+        )),
+    }
 }
 
 #[cfg(test)]
