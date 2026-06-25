@@ -6,9 +6,10 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use fluers_core::{Model, ModelProvider, RunConfig, Tool};
+use fluers_core::{Model, ModelProvider, RunConfig, Tool, ToolFactory};
 use fluers_protocol::RunRecord;
 use fluers_runtime::PersistenceAdapter;
+use tokio_util::sync::CancellationToken;
 
 /// A fully-resolved agent registered with the server.
 ///
@@ -19,14 +20,47 @@ pub struct AgentHandle {
     pub provider: Arc<dyn ModelProvider>,
     /// The model id.
     pub model: Model,
-    /// The tools the agent may call.
+    /// The tools the agent may call (legacy / no-subagents path).
+    ///
+    /// Ignored when [`AgentHandle::tool_factory`] is set.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Per-request tool builder. When set, takes precedence over [`tools`](AgentHandle::tools)
+    /// and is called for every request to produce a fresh tool list (including
+    /// a request-local `task` tool bound to that run's cancel token + event
+    /// sink). `None` for the legacy static-tools path.
+    pub tool_factory: Option<ToolFactory>,
     /// The run configuration (budgets, concurrency).
     pub config: RunConfig,
     /// The system prompt injected at session start.
     pub system_prompt: String,
     /// A short human-readable description (shown in `GET /agents`).
     pub description: String,
+}
+
+impl AgentHandle {
+    /// Build the tool list for a single request.
+    ///
+    /// If a [`ToolFactory`] is set, it is called with a [`ToolRequestContext`]
+    /// carrying this handle's provider/model/config plus the per-request
+    /// `cancel` + `event_sink` — so any `task` tool it builds is correctly
+    /// scoped to this run. Otherwise the static [`tools`](AgentHandle::tools)
+    /// list is cloned.
+    pub fn tools_for_request(
+        &self,
+        cancel: CancellationToken,
+        event_sink: Option<Arc<dyn fluers_core::EventSink>>,
+    ) -> Vec<Arc<dyn Tool>> {
+        match &self.tool_factory {
+            Some(factory) => factory(fluers_core::ToolRequestContext {
+                provider: self.provider.clone(),
+                parent_model: self.model.clone(),
+                parent_config: self.config.clone(),
+                cancel,
+                event_sink,
+            }),
+            None => self.tools.clone(),
+        }
+    }
 }
 
 /// Shared server state handed to every route handler.

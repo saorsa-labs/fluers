@@ -211,6 +211,16 @@ pub(crate) struct DevArgs {
     /// Disable all tools (text-only agent).
     #[arg(long, default_value_t = false)]
     pub no_tools: bool,
+    /// Path to a TOML config file. Defaults to `./fluers.toml` if present.
+    /// When the config declares `[agents.*]`, the dev server serves the
+    /// selected agent (MCP tools + subagent delegation) instead of the legacy
+    /// static-tools agent.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Name of the agent to serve (from `[agents.<name>]`). Defaults to
+    /// `"default"`. Only used when the config declares agents.
+    #[arg(long)]
+    pub agent: Option<String>,
 }
 
 /// Args for `build`.
@@ -600,6 +610,8 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
                 agent_name,
                 builtin,
                 Arc::clone(&provider),
+                model.clone(),
+                config.clone(),
                 event_sink_for_task,
                 cancel.clone(),
                 env.clone(),
@@ -683,12 +695,34 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `fluers dev` — boot the local HTTP server with a default agent.
+/// `fluers dev` — boot the local HTTP server.
+///
+/// When `--config` points at a config that declares `[agents.*]`, the server
+/// serves that agent (MCP tools + subagent delegation via a per-request tool
+/// factory). Otherwise it serves the legacy static-tools default agent.
 pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
+    // Load config: explicit --config, else ./fluers.toml if present.
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("fluers.toml"));
+    let cfg = crate::config::Config::load(&config_path)?;
+
+    // Resolve effective provider/model (CLI overrides config).
+    let provider_name = args
+        .provider
+        .clone()
+        .or(cfg.provider.clone())
+        .unwrap_or_else(|| "openrouter".into());
+    let model_id = args
+        .model
+        .clone()
+        .or(cfg.model.clone())
+        .unwrap_or_else(|| "minimax/minimax-m3".into());
     let provider = build_provider(&RunArgs {
-        provider: args.provider.clone(),
-        model: args.model.clone(),
-        base_url: None,
+        provider: Some(provider_name),
+        model: Some(model_id.clone()),
+        base_url: cfg.base_url.clone(),
         prompt: None,
         workdir: None,
         max_turns: None,
@@ -696,7 +730,7 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         tool_concurrency: None,
         no_tools: args.no_tools,
         stream: false,
-        api_key_env: None,
+        api_key_env: cfg.api_key_env.clone(),
         config: None,
         session: None,
         sessions_dir: None,
@@ -709,17 +743,64 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         agent: None,
         list_sessions: false,
     })?;
+    let provider: Arc<dyn fluers_core::ModelProvider> = Arc::new(provider);
+    let model = Model::new(&model_id);
+
     let workdir = args
         .workdir
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let env: Arc<dyn fluers_runtime::SessionEnv> =
         Arc::new(LocalSessionEnv::new(&workdir, Limits::default()).await?);
-    let tools: Vec<Arc<dyn Tool>> = if args.no_tools {
-        Vec::new()
+
+    // Build the agent handle. Two paths:
+    //  - config declares agents: resolve the spec once, install a per-request
+    //    ToolFactory (so MCP tools + a request-local `task` tool are built fresh
+    //    per request, keeping cancellation / events / budgets isolated).
+    //  - legacy: static builtins, no factory.
+    let (tool_factory, static_tools, system_prompt, description) = if cfg.has_agents() {
+        let agent_name = args.agent.as_deref().unwrap_or("default");
+        let builtin = if args.no_tools {
+            Vec::new()
+        } else {
+            fluers_runtime::mvp_tools(env.clone())
+        };
+        let spec = Arc::new(
+            crate::agent_config::resolve_agent_spec(&cfg, agent_name, builtin, env.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("agent config: {e}"))?,
+        );
+        let sys = spec
+            .instructions
+            .clone()
+            .unwrap_or_else(|| "You are a Fluers agent.".into());
+        let desc = spec
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("{agent_name} agent"));
+        // The factory captures the spec by Arc; each request builds a fresh
+        // tool list (static tools + a request-local TaskTool). The provider /
+        // model / config are supplied by `tools_for_request` from the handle.
+        let spec_for_factory = Arc::clone(&spec);
+        let factory: fluers_core::ToolFactory =
+            Arc::new(move |ctx| spec_for_factory.tools_for_run(ctx));
+        (Some(factory), Vec::new(), sys, desc)
     } else {
-        fluers_runtime::mvp_tools(env.clone())
+        let tools = if args.no_tools {
+            Vec::new()
+        } else {
+            fluers_runtime::mvp_tools(env.clone())
+        };
+        (
+            None,
+            tools,
+            "You are a Fluers agent. Use the provided tools when they help. \
+             Paths are relative to the working directory. Be concise."
+                .into(),
+            "default Fluers agent".into(),
+        )
     };
+
     let sessions: Arc<dyn fluers_runtime::PersistenceAdapter> =
         if let Some(url) = args.database_url.as_ref() {
             Arc::new(
@@ -739,14 +820,13 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         };
     let state = Arc::new(fluers_server::ServerState::new(sessions));
     let handle = fluers_server::AgentHandle {
-        provider: Arc::new(provider),
-        model: Model::new(args.model.as_deref().unwrap_or("minimax/minimax-m3")),
-        tools,
+        provider,
+        model,
+        tools: static_tools,
+        tool_factory,
         config: RunConfig::default(),
-        system_prompt: "You are a Fluers agent. Use the provided tools when they help. \
-                        Paths are relative to the working directory. Be concise."
-            .into(),
-        description: "default Fluers agent".into(),
+        system_prompt,
+        description,
     };
     state.register("default", handle);
 

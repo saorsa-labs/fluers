@@ -140,15 +140,21 @@ async fn invoke(
 
     let model = fluers_core::Model::new(&handle.model.id);
     let cancel = tokio_util::sync::CancellationToken::new();
-    let event_bus = fluers_runtime::EventBus::new_default();
+    let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
+    // Build the request's tools: static list (legacy) or a fresh factory-built
+    // list with a request-local `task` tool (config-UX). Either way, the tools
+    // are scoped to this request's cancel token + event bus.
+    let event_sink_arc: Arc<dyn fluers_core::EventSink> =
+        event_bus.clone() as Arc<dyn fluers_core::EventSink>;
+    let tools = handle.tools_for_request(cancel.clone(), Some(event_sink_arc));
     let hooks = fluers_core::RunHooks {
         session_id: Some(session_id),
         turn_sink: Some(runner.as_ref()),
-        event_sink: Some(&event_bus),
+        event_sink: Some(event_bus.as_ref()),
     };
     let outcome = run_agent(
         handle.provider.as_ref(),
-        &handle.tools,
+        &tools,
         &mut messages,
         &model,
         &handle.config,
@@ -200,18 +206,23 @@ async fn stream(
     // Bridge: run the streaming loop on a task, forwarding events to a channel.
     let (tx, rx) = mpsc::unbounded_channel::<SseEvent>();
     let provider = handle.provider.clone();
-    let tools = handle.tools.clone();
     let config = handle.config.clone();
     let model = fluers_core::Model::new(&handle.model.id);
     let state2 = state.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
+    // Tool building is deferred into the spawned task below so the request-local
+    // event bus (and thus the request-local `task` tool) is owned by the task.
+    let handle2 = handle.clone();
 
     tokio::spawn(async move {
-        let event_bus = fluers_runtime::EventBus::new_default();
+        let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
+        let event_sink_arc: Arc<dyn fluers_core::EventSink> =
+            event_bus.clone() as Arc<dyn fluers_core::EventSink>;
+        let tools = handle2.tools_for_request(cancel.clone(), Some(event_sink_arc));
         let hooks = fluers_core::RunHooks {
             session_id: Some(session_id),
             turn_sink: Some(runner.as_ref()),
-            event_sink: Some(&event_bus),
+            event_sink: Some(event_bus.as_ref()),
         };
         let mut on_event = |ev: &StreamEvent| {
             let sse = match ev {
@@ -416,6 +427,7 @@ mod tests {
             }),
             model: fluers_core::Model::new("mock/echo"),
             tools: vec![],
+            tool_factory: None,
             config: RunConfig {
                 max_turns: 2,
                 ..Default::default()
@@ -549,5 +561,131 @@ mod tests {
         assert!(text.contains("text_delta"), "missing text_delta: {text}");
         assert!(text.contains("hello"), "missing first chunk: {text}");
         assert!(text.contains("done"), "missing done: {text}");
+    }
+
+    /// A minimal tool used to verify factory-produced tools reach the run.
+    struct ProbeTool;
+    #[async_trait::async_trait]
+    impl fluers_core::Tool for ProbeTool {
+        fn definition(&self) -> fluers_core::ToolDefinition {
+            fluers_core::ToolDefinition {
+                name: "probe".into(),
+                label: "Probe".into(),
+                description: "a probe tool".into(),
+                parameters: fluers_core::ParameterSchema::default(),
+            }
+        }
+        async fn execute(
+            &self,
+            _ctx: fluers_core::InvokeContext,
+            _input: serde_json::Value,
+        ) -> fluers_core::error::Result<fluers_core::ToolResult> {
+            Ok(fluers_core::ToolResult {
+                content: vec![serde_json::json!({ "type": "text", "text": "probe ok" })],
+                details: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_factory_is_invoked_per_request_and_tools_reach_provider() {
+        // An agent with a ToolFactory: every /invoke must call the factory,
+        // and the factory-produced tools must be visible to the run. We assert
+        // this by injecting a custom tool into the factory and checking the
+        // provider sees it advertised (via the ModelRequest tools list).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let adapter: Arc<dyn PersistenceAdapter> = Arc::new(JsonFileAdapter::new(dir.path()));
+        let state = Arc::new(ServerState::new(adapter));
+
+        // A provider that records how many times it was invoked and captures
+        // the tool names it was offered.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let seen_tools = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        struct RecordingProvider {
+            calls: Arc<AtomicUsize>,
+            seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for RecordingProvider {
+            async fn invoke(
+                &self,
+                req: ModelRequest,
+            ) -> Result<ModelResponse, fluers_core::CoreError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+                *self.seen.lock() = names;
+                Ok(ModelResponse {
+                    messages: vec![AgentMessage {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text { text: "ok".into() }],
+                    }],
+                })
+            }
+        }
+        let provider: Arc<dyn ModelProvider> = Arc::new(RecordingProvider {
+            calls: Arc::clone(&call_count),
+            seen: Arc::clone(&seen_tools),
+        });
+
+        // A factory invocation counter.
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls2 = Arc::clone(&factory_calls);
+        let factory: fluers_core::ToolFactory = Arc::new(move |_ctx| {
+            factory_calls2.fetch_add(1, Ordering::SeqCst);
+            // Inject a recognizable custom tool so we can confirm the run saw it.
+            vec![Arc::new(ProbeTool) as Arc<dyn fluers_core::Tool>]
+        });
+
+        let handle = AgentHandle {
+            provider: provider.clone(),
+            model: fluers_core::Model::new("mock/rec"),
+            tools: vec![],
+            tool_factory: Some(factory),
+            config: RunConfig {
+                max_turns: 1,
+                ..Default::default()
+            },
+            system_prompt: "test".into(),
+            description: "factory agent".into(),
+        };
+        state.register("factory", handle);
+        let app = router(state);
+        use tower::ServiceExt;
+
+        // Two invokes → factory called twice, provider called twice, and the
+        // provider saw the factory-produced "probe" tool each time.
+        for _ in 0..2 {
+            let req = InvokeRequest {
+                prompt: "hi".into(),
+                session_id: None,
+            };
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/agents/factory/invoke")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(serde_json::to_vec(&req).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+            let _resp: InvokeResponse = serde_json::from_slice(&body).unwrap();
+        }
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            2,
+            "factory not called per request"
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "provider call count");
+        assert!(
+            seen_tools.lock().iter().any(|n| n == "probe"),
+            "factory tool did not reach provider: {:?}",
+            seen_tools.lock()
+        );
     }
 }

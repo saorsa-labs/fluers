@@ -72,19 +72,62 @@ pub enum AgentConfigError {
 /// Result alias.
 pub type AgentConfigResult<T> = std::result::Result<T, AgentConfigError>;
 
-/// The resolved agent: its tool list and, if subagents are declared, a ready
-/// [`TaskTool`] already included in the tool list.
-pub struct ResolvedAgent {
-    /// The complete tool list for the top-level run (built-ins + MCP tools +
-    /// `task` when subagents are declared).
-    pub tools: Vec<Arc<dyn Tool>>,
+/// The static resolution of a config-declared agent: everything that can be
+/// built once (at startup or run start) and reused. The per-request
+/// `task` tool is **not** here — it is built by [`tools_for_run`] from a
+/// [`ToolRequestContext`] so cancellation / events / delegation budget stay
+/// scoped to a single run.
+///
+/// [`tools_for_run`]: ResolvedAgentSpec::tools_for_run
+pub struct ResolvedAgentSpec {
+    /// Static tools (built-ins + MCP). Never includes `task`.
+    pub static_tools: Vec<Arc<dyn Tool>>,
+    /// The declared subagent graph (empty when the agent delegates nothing).
+    pub subagents: Vec<SubagentProfile>,
+    /// Depth / budget overrides for the top-level `task` tool.
+    pub options: SubagentOptions,
+    /// The agent's system message (used as the run's system prompt).
+    pub instructions: Option<String>,
+    /// The agent's delegation-guidance description (for `GET /agents`).
+    pub description: Option<String>,
+    /// Holds connected MCP server handles so their subprocesses live as long as
+    /// the spec (and thus the agent registration / run).
+    _mcp: McpCache,
 }
 
-impl std::fmt::Debug for ResolvedAgent {
+impl std::fmt::Debug for ResolvedAgentSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedAgent")
-            .field("tool_count", &self.tools.len())
+        f.debug_struct("ResolvedAgentSpec")
+            .field("static_tool_count", &self.static_tools.len())
+            .field("subagent_count", &self.subagents.len())
+            .field("max_depth", &self.options.max_depth)
+            .field("max_delegations", &self.options.max_delegations)
             .finish()
+    }
+}
+
+impl ResolvedAgentSpec {
+    /// Build the complete tool list for a single run.
+    ///
+    /// Returns the static tools, with a fresh top-level `TaskTool` **prepended**
+    /// (so it wins the `task` name lookup) when subagents are declared. The
+    /// `TaskTool` is bound to this run's cancel token + event sink + a fresh
+    /// delegation budget, so concurrent runs are fully isolated.
+    pub fn tools_for_run(&self, ctx: fluers_core::ToolRequestContext) -> Vec<Arc<dyn Tool>> {
+        let mut tools = self.static_tools.clone();
+        if !self.subagents.is_empty() {
+            let task = Arc::new(TaskTool::new(
+                ctx.provider,
+                ctx.parent_model,
+                ctx.parent_config,
+                self.subagents.clone(),
+                self.options,
+                ctx.cancel,
+                ctx.event_sink,
+            ));
+            tools.insert(0, task);
+        }
+        tools
     }
 }
 
@@ -163,11 +206,15 @@ impl McpCache {
     }
 }
 
-/// Resolve the selected agent into a [`ResolvedAgent`].
+/// Resolve the selected agent into a [`ResolvedAgentSpec`] (static: MCP
+/// connections, subagent graph, built-ins). Does **not** build the `task`
+/// tool — call [`ResolvedAgentSpec::tools_for_run`] with a per-run
+/// [`ToolRequestContext`] to get the full tool list.
 ///
-/// `builtin_tools` produces the standard read/write/bash/glob/grep set when
-/// the agent (or subagent) opts into them. `provider`, `event_sink`, `cancel`,
-/// and `env` are shared across the run / delegation tree.
+/// `builtin_tools` is the standard read/write/bash/glob/grep set, included
+/// when the agent opts into `builtin_tools` (top-level default `true`).
+/// `env` is shared across the subagent graph build (each subagent's own
+/// built-ins are constructed from it).
 ///
 /// # Errors
 /// - [`AgentConfigError::UnknownAgent`] if `agent` is not declared.
@@ -176,15 +223,12 @@ impl McpCache {
 /// - [`AgentConfigError::Cycle`] for recursive subagent cycles.
 /// - [`AgentConfigError::MissingEnvVar`] / [`AgentConfigError::UnsupportedTransport`]
 ///   / [`AgentConfigError::McpConnect`] for MCP failures.
-pub async fn resolve_agent(
+pub async fn resolve_agent_spec(
     cfg: &Config,
     agent: &str,
     builtin_tools: Vec<Arc<dyn Tool>>,
-    provider: Arc<dyn ModelProvider>,
-    event_sink: Option<Arc<dyn fluers_core::EventSink>>,
-    cancel: CancellationToken,
     env: Arc<dyn SessionEnv>,
-) -> AgentConfigResult<ResolvedAgent> {
+) -> AgentConfigResult<ResolvedAgentSpec> {
     if !cfg.agents.contains_key(agent) {
         let known: Vec<&str> = cfg.agents.keys().map(String::as_str).collect();
         return Err(AgentConfigError::UnknownAgent(
@@ -198,47 +242,79 @@ pub async fn resolve_agent(
     // Build the subagent graph for this agent (with cycle detection).
     let subagents = build_subagents(cfg, agent, &mut mcp_cache, env.clone()).await?;
 
-    // Build the top-level tool list.
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-
-    // Top-level agent: builtin_tools defaults to true.
+    // Build the static top-level tool list (built-ins + MCP). No `task` here.
+    let mut static_tools: Vec<Arc<dyn Tool>> = Vec::new();
     let agent_def = &cfg.agents[agent];
-    let use_builtins = agent_def.builtin_tools.unwrap_or(true);
-    if use_builtins {
-        tools.extend(builtin_tools);
+    if agent_def.builtin_tools.unwrap_or(true) {
+        static_tools.extend(builtin_tools);
     }
-
-    // Top-level MCP tools.
     for name in &agent_def.mcp_servers {
         let mcp_tools = resolve_mcp(cfg, agent, name, &mut mcp_cache).await?;
-        tools.extend(mcp_tools);
+        static_tools.extend(mcp_tools);
     }
 
-    // If this agent declares subagents, prepend a TaskTool (so it wins the
-    // "task" name lookup) configured from the agent's depth/budget overrides.
-    if !subagents.is_empty() {
-        let depth = agent_def.max_subagent_depth;
-        let delegations = agent_def.max_subagent_delegations;
-        // Walk the graph to find the effective defaults (the selected agent's
-        // overrides win; fall back to the SubagentOptions defaults).
-        let options = SubagentOptions {
-            max_depth: depth.unwrap_or(fluers_core::DEFAULT_MAX_DEPTH),
-            max_delegations: delegations.unwrap_or(fluers_core::DEFAULT_MAX_DELEGATIONS),
-        };
-        let model = fluers_core::Model {
-            id: cfg
-                .model
-                .clone()
-                .unwrap_or_else(|| "openrouter/auto".to_string()),
-        };
-        let config = fluers_core::RunConfig::default();
-        let task = Arc::new(TaskTool::new(
-            provider, model, config, subagents, options, cancel, event_sink,
-        ));
-        tools.insert(0, task);
-    }
+    let options = SubagentOptions {
+        max_depth: agent_def
+            .max_subagent_depth
+            .unwrap_or(fluers_core::DEFAULT_MAX_DEPTH),
+        max_delegations: agent_def
+            .max_subagent_delegations
+            .unwrap_or(fluers_core::DEFAULT_MAX_DELEGATIONS),
+    };
 
+    Ok(ResolvedAgentSpec {
+        static_tools,
+        subagents,
+        options,
+        instructions: agent_def.instructions.clone(),
+        description: agent_def.description.clone(),
+        _mcp: mcp_cache,
+    })
+}
+
+/// Convenience wrapper for the `fluers run` command (single run): resolve the
+/// spec, then build the tool list for one run. Pass the **actual** parent
+/// model + config — they are inherited by subagents that omit their own.
+///
+/// Hosts that serve many runs (the `dev` server) should use
+/// [`resolve_agent_spec`] + [`ResolvedAgentSpec::tools_for_run`] so the
+/// per-request `task` tool is built fresh per request.
+#[allow(clippy::too_many_arguments)] // thin convenience wrapper; args mirror inputs
+pub async fn resolve_agent(
+    cfg: &Config,
+    agent: &str,
+    builtin_tools: Vec<Arc<dyn Tool>>,
+    provider: Arc<dyn ModelProvider>,
+    parent_model: fluers_core::Model,
+    parent_config: fluers_core::RunConfig,
+    event_sink: Option<Arc<dyn fluers_core::EventSink>>,
+    cancel: CancellationToken,
+    env: Arc<dyn SessionEnv>,
+) -> AgentConfigResult<ResolvedAgent> {
+    let spec = resolve_agent_spec(cfg, agent, builtin_tools, env).await?;
+    let tools = spec.tools_for_run(fluers_core::ToolRequestContext {
+        provider,
+        parent_model,
+        parent_config,
+        cancel,
+        event_sink,
+    });
     Ok(ResolvedAgent { tools })
+}
+
+/// The resolved tool list for a single run (the `fluers run` convenience type).
+pub struct ResolvedAgent {
+    /// The complete tool list for the run (built-ins + MCP + `task` when
+    /// subagents are declared).
+    pub tools: Vec<Arc<dyn Tool>>,
+}
+
+impl std::fmt::Debug for ResolvedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedAgent")
+            .field("tool_count", &self.tools.len())
+            .finish()
+    }
 }
 
 /// Resolve an MCP server reference for `agent`, with a helpful error listing
@@ -348,6 +424,7 @@ async fn build_subagents_inner(
 mod tests {
     use super::*;
     use crate::config::{AgentToml, Config, McpServerToml, McpToml};
+    use fluers_core::InvokeContext;
     use std::collections::BTreeMap;
 
     fn agent(instructions: &str) -> AgentToml {
@@ -429,6 +506,8 @@ model = "minimax/minimax-m3"
             "ghost",
             vec![],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -450,6 +529,8 @@ model = "minimax/minimax-m3"
             "default",
             vec![],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -471,6 +552,8 @@ model = "minimax/minimax-m3"
             "default",
             vec![],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -495,6 +578,8 @@ model = "minimax/minimax-m3"
             "default",
             vec![],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -526,6 +611,8 @@ model = "minimax/minimax-m3"
             "default",
             vec![],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -558,6 +645,8 @@ model = "minimax/minimax-m3"
             "default",
             vec![],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -577,6 +666,8 @@ model = "minimax/minimax-m3"
             "default",
             vec![Arc::new(EchoBuiltin) as Arc<dyn Tool>],
             stub_provider(),
+            fluers_core::Model { id: "test".into() },
+            fluers_core::RunConfig::default(),
             None,
             cancel(),
             env().await,
@@ -586,6 +677,113 @@ model = "minimax/minimax-m3"
         assert_eq!(resolved.tools.len(), 1);
         // No "task" tool (no subagents).
         assert!(resolved.tools.iter().all(|t| t.definition().name != "task"));
+    }
+
+    #[tokio::test]
+    async fn spec_static_tools_exclude_task_then_run_prepends_it() {
+        // An agent WITH subagents: the spec's static_tools must NOT contain
+        // `task` (it's per-request); tools_for_run must prepend it.
+        let mut root = agent("root");
+        root.subagents = vec!["worker".into()];
+        let cfg = cfg_with_agents(vec![("default", root), ("worker", agent("a worker"))]);
+        let spec = resolve_agent_spec(
+            &cfg,
+            "default",
+            vec![Arc::new(EchoBuiltin) as Arc<dyn Tool>],
+            env().await,
+        )
+        .await
+        .expect("spec");
+        // Static list: just the builtin (no task).
+        assert_eq!(spec.static_tools.len(), 1);
+        assert!(spec
+            .static_tools
+            .iter()
+            .all(|t| t.definition().name != "task"));
+
+        // tools_for_run: builtin + a fresh task prepended.
+        let ctx = fluers_core::ToolRequestContext {
+            provider: stub_provider(),
+            parent_model: fluers_core::Model { id: "test".into() },
+            parent_config: fluers_core::RunConfig::default(),
+            cancel: cancel(),
+            event_sink: None,
+        };
+        let tools = spec.tools_for_run(ctx);
+        assert_eq!(tools.len(), 2);
+        // task wins name lookup (prepended at index 0).
+        assert_eq!(tools[0].definition().name, "task");
+    }
+
+    #[tokio::test]
+    async fn two_runs_get_independent_delegation_budgets() {
+        // Two tools_for_run calls (two requests) must produce TaskTools with
+        // INDEPENDENT delegation budgets — exhausting one must not affect the
+        // other. (A static shared TaskTool would fail this.)
+        let mut root = agent("root");
+        root.subagents = vec!["worker".into()];
+        root.max_subagent_delegations = Some(1);
+        let cfg = cfg_with_agents(vec![("default", root), ("worker", agent("a worker"))]);
+        let spec = resolve_agent_spec(&cfg, "default", vec![], env().await)
+            .await
+            .expect("spec");
+        let mk = || {
+            spec.tools_for_run(fluers_core::ToolRequestContext {
+                provider: text_provider(),
+                parent_model: fluers_core::Model { id: "test".into() },
+                parent_config: fluers_core::RunConfig::default(),
+                cancel: cancel(),
+                event_sink: None,
+            })
+        };
+        let run_a = mk();
+        let run_b = mk();
+        // Both have a task tool.
+        let task_a = run_a
+            .iter()
+            .find(|t| t.definition().name == "task")
+            .expect("run_a has task");
+        let task_b = run_b
+            .iter()
+            .find(|t| t.definition().name == "task")
+            .expect("run_b has task");
+        // Exhaust run_a's single delegation (the text provider lets the child run complete).
+        let ctx = InvokeContext {
+            tool_call_id: "a1".into(),
+            cancel: cancel(),
+        };
+        let ok_a1 = task_a
+            .execute(
+                ctx,
+                serde_json::json!({ "agent": "worker", "prompt": "go" }),
+            )
+            .await;
+        assert!(ok_a1.is_ok(), "run_a first delegation: {ok_a1:?}");
+        // run_a's next delegation must be budget-exhausted...
+        let ctx2 = InvokeContext {
+            tool_call_id: "a2".into(),
+            cancel: cancel(),
+        };
+        let err_a = task_a
+            .execute(
+                ctx2,
+                serde_json::json!({ "agent": "worker", "prompt": "again" }),
+            )
+            .await
+            .expect_err("run_a budget exhausted");
+        assert!(err_a.to_string().contains("budget exhausted"));
+        // ...but run_b's first delegation must STILL succeed (independent budget).
+        let ctx3 = InvokeContext {
+            tool_call_id: "b1".into(),
+            cancel: cancel(),
+        };
+        let ok_b = task_b
+            .execute(
+                ctx3,
+                serde_json::json!({ "agent": "worker", "prompt": "fresh" }),
+            )
+            .await;
+        assert!(ok_b.is_ok(), "run_b independent budget: {ok_b:?}");
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -618,6 +816,30 @@ model = "minimax/minimax-m3"
             }
         }
         Arc::new(Stub)
+    }
+
+    /// A provider that returns a minimal valid assistant text response, so a
+    /// delegated child run completes successfully.
+    fn text_provider() -> Arc<dyn ModelProvider> {
+        use async_trait::async_trait;
+        struct Text;
+        #[async_trait]
+        impl ModelProvider for Text {
+            async fn invoke(
+                &self,
+                _r: fluers_core::ModelRequest,
+            ) -> fluers_core::error::Result<fluers_core::ModelResponse> {
+                Ok(fluers_core::ModelResponse {
+                    messages: vec![fluers_core::message::AgentMessage {
+                        role: fluers_core::message::Role::Assistant,
+                        content: vec![fluers_core::message::ContentBlock::Text {
+                            text: "child done".into(),
+                        }],
+                    }],
+                })
+            }
+        }
+        Arc::new(Text)
     }
 
     struct EchoBuiltin;
