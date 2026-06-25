@@ -172,3 +172,43 @@ In `fluers-server/src/lib.rs`, both `invoke` and `stream`:
   `/invoke` can call builtins, MCP tools, and `task` (subagent delegation).
 - Concurrent requests get independent cancellation + delegation budgets.
 - `cargo nextest run --workspace` green; fmt + strict clippy clean.
+
+## Accepted risks (post-review)
+
+Folded from the focused reviewer + red-team review of the implementation.
+
+**Fixed (this slice):**
+- Removed a spurious second `mark_run(RunStatus::Running)` left in `invoke`
+  after `run_agent` completed (copy-paste leftover; the following
+  `update_run(Completed)` overrode it, but it was semantically wrong).
+- Resume-model consistency: `resolve_session` now returns the model id to use
+  (persisted on resume, the handle's for a new session) so the run's model, the
+  provider call, and a `task` tool's `parent_model` all agree. Previously the
+  persisted model was read into `_model_id` and discarded.
+- `dev` now honors config-level budgets (`max_turns` / `turn_timeout_ms` /
+  `tool_concurrency`) so the served agent matches `fluers run` semantics.
+- Startup `eprintln` notes the active mode (config vs legacy), that config is
+  resolved once (restart to reload), and the single-user shared-workdir caveat.
+
+**Pre-existing, accepted (not introduced by this slice):**
+- **Panic isolation.** A panicking tool aborts the request task (axum/tokio
+  catch it at the task boundary, so the server stays up, but the client gets a
+  connection drop rather than a clean 500). `run_agent` only wraps tool
+  execution in `catch_unwind` on the parallel path (`tool_concurrency > 1`);
+  the default sequential path propagates. Mitigating this is a future
+  hardening pass over `fluers-core::runner`.
+- **Shared `SessionEnv` / workdir.** `dev` builds one `LocalSessionEnv` shared
+  by all requests; concurrent `/invoke`s can race on file writes / shell exec.
+  Accepted for local single-user dev (the intent of `fluers dev`). Multi-tenant
+  isolation waits on a real `Sandbox` + HTTP auth.
+- **Concurrent resume on the same `session_id`.** Two requests resuming the
+  same session load identical history and run independently; whichever
+  `after_turn` persists last wins (turns from the other may be lost).
+- **Detached `/stream` tasks.** The streaming handler spawns and never joins;
+  if the client disconnects the task keeps running and writes to the in-memory
+  run store.
+- **Unbounded in-memory run store.** `ServerState.runs` is never pruned.
+  Long-lived dev servers can grow without bound.
+- **MCP subprocess reaping on abnormal task leak.** `kill_on_drop` ensures
+  clean shutdown reaps subprocesses; an abnormally leaked `/stream` task holds
+  a tool `Arc` that keeps the subprocess alive until that task finishes.

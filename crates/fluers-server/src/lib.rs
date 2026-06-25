@@ -132,13 +132,14 @@ async fn invoke(
     // Resolve / create the session and build the message history. The runner
     // is only the TurnSink; the loop owns the messages.
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
-    let (mut messages, runner) = resolve_session(&state, session_id, &req.prompt, &handle)
-        .await
-        .map_err(map_err)?;
+    let (mut messages, runner, model_id) =
+        resolve_session(&state, session_id, &req.prompt, &handle)
+            .await
+            .map_err(map_err)?;
 
     mark_run(&state, run_id, session_id, RunStatus::Running);
 
-    let model = fluers_core::Model::new(&handle.model.id);
+    let model = fluers_core::Model::new(&model_id);
     let cancel = tokio_util::sync::CancellationToken::new();
     let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
     // Build the request's tools: static list (legacy) or a fresh factory-built
@@ -163,8 +164,6 @@ async fn invoke(
     )
     .await
     .map_err(map_err)?;
-
-    mark_run(&state, run_id, session_id, RunStatus::Running);
 
     let resp = InvokeResponse {
         run_id,
@@ -197,9 +196,10 @@ async fn stream(
     };
     let run_id = Uuid::new_v4();
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
-    let (mut messages, runner) = resolve_session(&state, session_id, &req.prompt, &handle)
-        .await
-        .map_err(map_err)?;
+    let (mut messages, runner, model_id) =
+        resolve_session(&state, session_id, &req.prompt, &handle)
+            .await
+            .map_err(map_err)?;
 
     mark_run(&state, run_id, session_id, RunStatus::Running);
 
@@ -207,7 +207,7 @@ async fn stream(
     let (tx, rx) = mpsc::unbounded_channel::<SseEvent>();
     let provider = handle.provider.clone();
     let config = handle.config.clone();
-    let model = fluers_core::Model::new(&handle.model.id);
+    let model = fluers_core::Model::new(&model_id);
     let state2 = state.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
     // Tool building is deferred into the spawned task below so the request-local
@@ -302,17 +302,20 @@ async fn resolve_session(
     session_id: Uuid,
     prompt: &str,
     handle: &AgentHandle,
-) -> anyhow::Result<(Vec<AgentMessage>, Box<SessionRunner>)> {
+) -> anyhow::Result<(Vec<AgentMessage>, Box<SessionRunner>, String)> {
+    // Returns (messages, runner, model_id_to_use). On resume the persisted
+    // model wins; on a new session the agent handle's model wins. Threading
+    // it back (rather than re-reading `handle.model` at the call site) keeps
+    // the run's model consistent with the persisted session metadata — so a
+    // `task` tool's `parent_model` and the provider call agree.
     let adapter = state.sessions.clone();
     let default_model = handle.model.id.clone();
     let default_max_turns = handle.config.max_turns;
     let default_system = handle.system_prompt.clone();
     match SessionRunner::load(adapter.clone(), session_id).await? {
         Some(runner) => {
-            // Resume: use the runner's persisted model/max_turns, append the
-            // prompt as a fresh user turn.
-            let _model_id = runner.model_id().to_string();
-            let _max_turns = runner.max_turns();
+            // Resume: the persisted model wins. Append the prompt as a fresh user turn.
+            let model_id = runner.model_id().to_string();
             let mut messages = runner.messages();
             messages.push(AgentMessage {
                 role: Role::User,
@@ -320,7 +323,7 @@ async fn resolve_session(
                     text: prompt.into(),
                 }],
             });
-            Ok((messages, Box::new(runner)))
+            Ok((messages, Box::new(runner), model_id))
         }
         None => {
             // New session: seed system + user, build a fresh runner.
@@ -341,11 +344,11 @@ async fn resolve_session(
             let runner = SessionRunner::new(
                 adapter,
                 session_id,
-                default_model,
+                default_model.clone(),
                 default_max_turns,
                 Some(default_system),
             );
-            Ok((messages, Box::new(runner)))
+            Ok((messages, Box::new(runner), default_model))
         }
     }
 }

@@ -819,12 +819,21 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
             Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir))
         };
     let state = Arc::new(fluers_server::ServerState::new(sessions));
+    // Honor config-level budgets (max_turns / turn_timeout_ms / tool_concurrency)
+    // so the served agent matches `fluers run` semantics.
+    let config = RunConfig {
+        max_turns: cfg.max_turns.unwrap_or(12),
+        turn_timeout_ms: cfg.turn_timeout_ms.or(Some(120_000)),
+        tool_concurrency: cfg.tool_concurrency.unwrap_or(1),
+        ..Default::default()
+    };
+    let is_config_mode = cfg.has_agents();
     let handle = fluers_server::AgentHandle {
         provider,
         model,
         tools: static_tools,
         tool_factory,
-        config: RunConfig::default(),
+        config,
         system_prompt,
         description,
     };
@@ -832,6 +841,12 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     eprintln!("→ fluers dev server");
+    if is_config_mode {
+        eprintln!("  mode: config (`[agents.*]` resolved at startup; restart to reload)");
+    } else {
+        eprintln!("  mode: legacy (built-in tools, no config agents)");
+    }
+    eprintln!("  note: single-user local dev — one shared workdir across requests");
     eprintln!("  endpoints:");
     eprintln!("    GET    /health");
     eprintln!("    GET    /agents");
