@@ -98,7 +98,11 @@ impl McpError {
 pub type Result<T> = std::result::Result<T, McpError>;
 
 /// How to spawn a stdio MCP server subprocess.
-#[derive(Debug, Clone)]
+///
+/// NOTE: this type has a custom [`Debug`] impl that redacts the `env` map,
+/// so secrets passed via `env`/`env_from` are never leaked if a config is
+/// logged or serialized via `{:?}`.
+#[derive(Clone)]
 pub struct StdioMcpServerConfig {
     /// Friendly name used in the adapted tool name (`mcp__<name>__<tool>`).
     pub name: String,
@@ -131,6 +135,20 @@ impl StdioMcpServerConfig {
             cmd.env(k, v);
         }
         cmd
+    }
+}
+
+impl std::fmt::Debug for StdioMcpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the env map so secrets never leak via `{:?}`.
+        f.debug_struct("StdioMcpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("request_timeout", &self.request_timeout)
+            .field("env", &format!("<{} redacted>", self.env.len()))
+            .finish()
     }
 }
 
@@ -556,6 +574,27 @@ mod tests {
             request_timeout: Duration::from_secs(5),
         };
         let _cmd = cfg.build_command();
+    }
+
+    #[test]
+    fn stdio_config_debug_redacts_env_secrets() {
+        let cfg = StdioMcpServerConfig {
+            name: "secret-server".into(),
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::from([("API_TOKEN".into(), "super-secret-value".into())]),
+            cwd: None,
+            request_timeout: Duration::from_secs(5),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("StdioMcpServerConfig"));
+        // The secret value must NEVER appear in the Debug output.
+        assert!(
+            !dbg.contains("super-secret-value"),
+            "secret leaked in Debug: {dbg}"
+        );
+        // The redaction marker should be present.
+        assert!(dbg.contains("redacted"), "missing redaction marker: {dbg}");
     }
 
     #[test]

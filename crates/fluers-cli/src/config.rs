@@ -7,6 +7,16 @@
 //!
 //! See `docs/CONFIG_UX_DESIGN.md` for the `[agents.*]` and `[mcp.servers.*]`
 //! agent/MCP config surface.
+//!
+//! # Trust boundary
+//!
+//! The config file author is **trusted**: agent `instructions`/`description`
+//! are forwarded verbatim to the model (a malicious config could inject
+//! prompts), and MCP `command`/`args` are exec'd directly (no shell). This
+//! matches the trust model of every local tool runner — treat your
+//! `fluers.toml` the same way you treat your `.bashrc`.
+//! **No raw secrets appear in the file** — `env_from` maps to host env var
+//! *names*, which are resolved at run start and injected into MCP subprocesses.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

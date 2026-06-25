@@ -14,7 +14,7 @@
 //! - Missing/empty host env vars referenced by `env_from` (resolved at connect
 //!   time, just before the run).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,7 +92,12 @@ impl std::fmt::Debug for ResolvedAgent {
 struct McpCache {
     /// Server name → adapted tool handles.
     tools: HashMap<String, Vec<Arc<dyn Tool>>>,
-    /// Keep the servers alive (they own the subprocesses) until the run ends.
+    /// Holds `McpServer` handles so subprocesses aren't dropped while the
+    /// cache lives. Note: the actual run-long lifetime comes from the
+    /// `Arc<RunningService>` cloned into each adapted tool (in `fluers-mcp`);
+    /// this vec is a secondary hold that is dropped when `resolve_agent`
+    /// returns. Tools returned to the caller keep the subprocesses alive
+    /// for the whole run via their cloned Arcs.
     _servers: Vec<McpServer>,
 }
 
@@ -118,7 +123,7 @@ impl McpCache {
             None | Some("stdio") => {}
             Some(other) => {
                 return Err(AgentConfigError::UnsupportedTransport(format!(
-                    "{name}: transport={other}"
+                    "server `{name}` declared transport `{other}`"
                 )));
             }
         }
@@ -263,16 +268,15 @@ async fn build_subagents(
     cache: &mut McpCache,
     env: Arc<dyn SessionEnv>,
 ) -> AgentConfigResult<Vec<SubagentProfile>> {
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    visited.insert(agent.to_string());
-    build_subagents_inner(cfg, agent, cache, &mut visited, env).await
+    let mut path: Vec<String> = vec![agent.to_string()];
+    build_subagents_inner(cfg, agent, cache, &mut path, env).await
 }
 
 async fn build_subagents_inner(
     cfg: &Config,
     agent: &str,
     cache: &mut McpCache,
-    visited: &mut BTreeSet<String>,
+    path: &mut Vec<String>,
     env: Arc<dyn SessionEnv>,
 ) -> AgentConfigResult<Vec<SubagentProfile>> {
     let agent_def = cfg.agents.get(agent).ok_or_else(|| {
@@ -282,10 +286,12 @@ async fn build_subagents_inner(
 
     let mut out = Vec::new();
     for child_name in &agent_def.subagents {
-        // Cycle detection.
-        if !visited.insert(child_name.clone()) {
-            let chain = format_cycle_chain(visited, child_name);
-            return Err(AgentConfigError::Cycle(chain));
+        // Cycle detection: if the child is already on the current recursion
+        // path, we've found a back-edge.
+        if path.iter().any(|p| p == child_name) {
+            let mut chain = path.clone();
+            chain.push(child_name.clone());
+            return Err(AgentConfigError::Cycle(chain.join(" → ")));
         }
 
         let child_def = cfg.agents.get(child_name).ok_or_else(|| {
@@ -307,15 +313,17 @@ async fn build_subagents_inner(
             child_tools.extend(mcp_tools);
         }
 
-        // Recurse into the child's own subagents.
+        // Recurse into the child's own subagents (push/pop for path tracking).
+        path.push(child_name.clone());
         let child_subagents = Box::pin(build_subagents_inner(
             cfg,
             child_name,
             cache,
-            visited,
+            path,
             env.clone(),
         ))
         .await?;
+        path.pop();
 
         let mut profile = SubagentProfile::new(
             child_name.clone(),
@@ -331,19 +339,8 @@ async fn build_subagents_inner(
             profile = profile.with_subagent(s);
         }
         out.push(profile);
-
-        // Backtrack so siblings aren't flagged as cycles.
-        visited.remove(child_name);
     }
     Ok(out)
-}
-
-/// Render a human-readable cycle chain for an error message.
-fn format_cycle_chain(visited: &BTreeSet<String>, repeated: &str) -> String {
-    // Best-effort: show the visited set + the repeated name.
-    let mut names: Vec<&str> = visited.iter().map(String::as_str).collect();
-    names.push(repeated);
-    names.join(" → ")
 }
 
 #[cfg(test)]
