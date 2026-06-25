@@ -39,6 +39,9 @@ pub use event::{EventSink, NullEventSink, RunEvent, RunHooks};
 pub use message::{AgentMessage, ContentBlock, ImageContent, Role, SignalMessage};
 pub use model::{Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent};
 pub use runner::{run_agent, run_agent_streaming, FanoutTurnSink, RunConfig, RunOutcome, TurnSink};
+pub use subagent::{
+    SubagentOptions, SubagentProfile, TaskTool, DEFAULT_MAX_DELEGATIONS, DEFAULT_MAX_DEPTH,
+};
 pub use thinking::ThinkingLevel;
 pub use tool::{
     InvokeContext, JsonValue, ParameterSchema, Tool, ToolCall, ToolDefinition, ToolResult,

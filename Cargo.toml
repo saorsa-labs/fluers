@@ -107,6 +107,7 @@ fluers-server = { path = "crates/fluers-server", version = "0.1.0" }
 fluers-postgres = { path = "crates/fluers-postgres", version = "0.1.0" }
 fluers-memory = { path = "crates/fluers-memory", version = "0.1.0" }
 fluers-otel = { path = "crates/fluers-otel", version = "0.1.0" }
+fluers-mcp = { path = "crates/fluers-mcp", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

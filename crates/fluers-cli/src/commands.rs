@@ -156,6 +156,11 @@ pub(crate) struct RunArgs {
     /// `FLUERS_OTEL_ENDPOINT`.
     #[arg(long, env = "FLUERS_OTEL_ENDPOINT")]
     pub otel_endpoint: Option<String>,
+    /// Which declared agent profile to run (from `[agents.<name>]` in the
+    /// config file). Defaults to `"default"` when the config declares agents;
+    /// ignored in legacy mode (no `[agents.*]`).
+    #[arg(long)]
+    pub agent: Option<String>,
     /// List persisted session ids and exit.
     #[arg(long, default_value_t = false)]
     pub list_sessions: bool,
@@ -290,27 +295,27 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     let provider_name = args
         .provider
         .clone()
-        .or(cfg.provider)
+        .or(cfg.provider.clone())
         .unwrap_or_else(|| "openrouter".into());
     let model = args
         .model
         .clone()
-        .or(cfg.model)
+        .or(cfg.model.clone())
         .unwrap_or_else(|| "minimax/minimax-m3".into());
     let workdir = args
         .workdir
         .clone()
-        .or(cfg.workdir)
+        .or(cfg.workdir.clone())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let max_turns = args.max_turns.or(cfg.max_turns).unwrap_or(12);
     let turn_timeout_ms = args.turn_timeout_ms.or(cfg.turn_timeout_ms);
     let tool_concurrency = args.tool_concurrency.or(cfg.tool_concurrency).unwrap_or(1);
-    let api_key_env = args.api_key_env.clone().or(cfg.api_key_env);
+    let api_key_env = args.api_key_env.clone().or(cfg.api_key_env.clone());
 
     let merged = RunArgs {
         provider: Some(provider_name),
         model: Some(model),
-        base_url: args.base_url.clone().or(cfg.base_url),
+        base_url: args.base_url.clone().or(cfg.base_url.clone()),
         prompt: args.prompt.clone(),
         workdir: Some(workdir.clone()),
         max_turns: Some(max_turns),
@@ -328,6 +333,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         memory_user_id: args.memory_user_id.clone(),
         memory_limit: args.memory_limit,
         otel_endpoint: args.otel_endpoint.clone(),
+        agent: args.agent.clone(),
         list_sessions: false,
     };
 
@@ -370,14 +376,14 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let provider = build_provider(&merged)?;
+    let provider: Arc<dyn fluers_core::ModelProvider> = Arc::new(provider);
     let env: Arc<dyn fluers_runtime::SessionEnv> =
         Arc::new(LocalSessionEnv::new(&workdir, Limits::default()).await?);
 
-    let tools: Vec<Arc<dyn Tool>> = if merged.no_tools {
-        Vec::new()
-    } else {
-        fluers_runtime::mvp_tools(env.clone())
-    };
+    // Tools are built after the event bus + cancel token exist (config-UX
+    // mode needs both to construct a TaskTool). Placeholder here; resolved
+    // just before the run.
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
     // Resolve the session id: explicit --session, else generate a new one.
     let session_id = match &merged.session {
@@ -516,22 +522,22 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     // configured, spawn the OTLP exporter; otherwise use tracing.
     // The provider + handle are held until the end of the run so pending
     // spans flush before the function returns.
-    let event_bus = fluers_runtime::EventBus::new_default();
+    let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
     let otel_provider: Option<fluers_otel::SdkTracerProvider> =
         if let Some(endpoint) = &merged.otel_endpoint {
-            match fluers_otel::otlp_subscriber(&event_bus, endpoint) {
+            match fluers_otel::otlp_subscriber(event_bus.as_ref(), endpoint) {
                 Ok((_handle, provider)) => {
                     eprintln!("→ OTLP tracing enabled: {endpoint}");
                     Some(provider)
                 }
                 Err(e) => {
                     eprintln!("→ OTLP setup failed (falling back to tracing): {e}");
-                    let _tracing = fluers_otel::tracing_subscriber(&event_bus);
+                    let _tracing = fluers_otel::tracing_subscriber(event_bus.as_ref());
                     None
                 }
             }
         } else {
-            let _tracing = fluers_otel::tracing_subscriber(&event_bus);
+            let _tracing = fluers_otel::tracing_subscriber(event_bus.as_ref());
             None
         };
     /// Force-flush the OTLP provider (if any) so pending spans export before
@@ -545,7 +551,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             }
         };
     }
-    let event_sink: &dyn fluers_core::EventSink = &event_bus;
+    let event_sink: &dyn fluers_core::EventSink = event_bus.as_ref();
 
     // Build the effective RunHooks: session id, persistence/memory turn sink,
     // and the event sink for observability.
@@ -563,6 +569,33 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         ..Default::default()
     };
     let cancel = CancellationToken::new();
+
+    // Build the tool list now that the event bus + cancel exist.
+    // - --no-tools: all tools disabled (builtins + MCP + task).
+    // - config declares agents: resolve via agent_config (builtins + MCP + task).
+    // - legacy: built-in tools only.
+    if !merged.no_tools {
+        if cfg.has_agents() {
+            let agent_name = merged.agent.as_deref().unwrap_or("default");
+            let builtin = fluers_runtime::mvp_tools(env.clone());
+            let event_sink_for_task: Option<Arc<dyn fluers_core::EventSink>> =
+                Some(Arc::clone(&event_bus) as Arc<dyn fluers_core::EventSink>);
+            let resolved = crate::agent_config::resolve_agent(
+                &cfg,
+                agent_name,
+                builtin,
+                Arc::clone(&provider),
+                event_sink_for_task,
+                cancel.clone(),
+                env.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("agent config: {e}"))?;
+            tools = resolved.tools;
+        } else {
+            tools = fluers_runtime::mvp_tools(env.clone());
+        }
+    }
 
     if resuming {
         let prior = if merged.prompt.is_some() {
@@ -594,7 +627,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
             }
         };
         let outcome = run_agent_streaming(
-            &provider,
+            provider.as_ref(),
             &tools,
             &mut messages,
             &model,
@@ -617,7 +650,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let outcome = run_agent(
-        &provider,
+        provider.as_ref(),
         &tools,
         &mut messages,
         &model,
@@ -658,6 +691,7 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         memory_user_id: None,
         memory_limit: 5,
         otel_endpoint: None,
+        agent: None,
         list_sessions: false,
     })?;
     let workdir = args

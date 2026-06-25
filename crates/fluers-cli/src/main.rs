@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agent_config;
 mod commands;
 mod config;
 
