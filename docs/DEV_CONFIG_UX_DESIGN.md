@@ -191,12 +191,14 @@ Folded from the focused reviewer + red-team review of the implementation.
   resolved once (restart to reload), and the single-user shared-workdir caveat.
 
 **Pre-existing, accepted (not introduced by this slice):**
-- **Panic isolation.** A panicking tool aborts the request task (axum/tokio
-  catch it at the task boundary, so the server stays up, but the client gets a
-  connection drop rather than a clean 500). `run_agent` only wraps tool
-  execution in `catch_unwind` on the parallel path (`tool_concurrency > 1`);
-  the default sequential path propagates. Mitigating this is a future
-  hardening pass over `fluers-core::runner`.
+- **Tool-panic isolation (hardened).** A panicking `tool.execute` is caught on
+  **both** the sequential and parallel paths and converted to a model-visible
+  `Error:` result, so a buggy/hostile tool no longer aborts the run. The panic
+  summary is bounded to 200 chars and goes only into the model-visible result
+  (never into telemetry — `tracing::warn!` logs only `tool` + `call_id` to
+  avoid leaking payload contents to a remote collector). Remaining, non-
+  catchable failure modes: aborting panics (e.g. a binary built with
+  `panic = "abort"`), provider panics, OOM, and SIGSEGV.
 - **Shared `SessionEnv` / workdir.** `dev` builds one `LocalSessionEnv` shared
   by all requests; concurrent `/invoke`s can race on file writes / shell exec.
   Accepted for local single-user dev (the intent of `fluers dev`). Multi-tenant

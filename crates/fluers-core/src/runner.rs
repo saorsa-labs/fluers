@@ -559,8 +559,41 @@ pub async fn run_agent_streaming(
     }
 }
 
+/// Maximum length of a panic message we surface to the model (a panic payload
+/// may carry arbitrarily large text). Matches `event::ERROR_SUMMARY_MAX_CHARS`.
+const PANIC_SUMMARY_MAX_CHARS: usize = 200;
+
+/// Render a panic payload into a bounded, model-safe summary string.
+///
+/// Panic payloads are `Box<dyn Any + Send>`; the common cases are `&'static str`
+/// and `String`. Anything else falls back to a generic marker.
+fn summarize_panic(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let raw = payload
+        .downcast_ref::<&'static str>()
+        .map(std::string::ToString::to_string)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    let chars: Vec<char> = raw.chars().collect();
+    if chars.len() <= PANIC_SUMMARY_MAX_CHARS {
+        raw
+    } else {
+        let truncated: String = chars
+            .into_iter()
+            .take(PANIC_SUMMARY_MAX_CHARS - 1)
+            .collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Execute a single tool call, returning a result even on error (so the
 /// model can recover) rather than aborting the whole run.
+///
+/// **Panic safety:** a panic inside `tool.execute` is caught and converted to a
+/// model-visible `Error:` result, matching the parallel path's `JoinSet`
+/// behaviour. This keeps a buggy / hostile tool from aborting the whole run on
+/// the default (`tool_concurrency == 1`) path. `catch_unwind` is best-effort:
+/// it catches unwinding panics but not aborts (e.g. `panic = "abort"`, OOM,
+/// SIGSEGV).
 async fn execute_tool_call(
     tools: &[Arc<dyn Tool>],
     id: &str,
@@ -574,9 +607,27 @@ async fn execute_tool_call(
         tool_call_id: id.to_string(),
         cancel: cancel.clone(),
     };
-    match tool.execute(ctx, call.input.clone()).await {
-        Ok(result) => result,
-        Err(err) => error_result(&err.to_string()),
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    match AssertUnwindSafe(tool.execute(ctx, call.input.clone()))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => error_result(&err.to_string()),
+        Err(payload) => {
+            let summary = summarize_panic(&payload);
+            // Log only structural metadata: panic payloads may contain user
+            // data/secrets, and `tracing` can export to a remote collector.
+            // The bounded `summary` goes only into the model-visible result
+            // (the agent's own context), never into telemetry.
+            tracing::warn!(
+                tool = %call.name,
+                call_id = %id,
+                "tool panicked; converted to model-visible error result"
+            );
+            error_result(&format!("tool `{}` panicked: {summary}", call.name))
+        }
     }
 }
 
@@ -644,6 +695,11 @@ async fn execute_tool_calls(
 
     // Bounded-parallel path. Spawn one task per call, tagged with its index.
     use tokio::task::JoinSet;
+    // Initialized up here (not at collection time) so the throttling loop can
+    // record early-completing tasks without dropping them. (Previously the
+    // throttle `join_next` discarded its drained result — a real bug that lost
+    // results whenever `calls.len() > tool_concurrency`.)
+    let mut indexed: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
     let mut set: JoinSet<(usize, ToolResult)> = JoinSet::new();
     for (i, (id, call)) in calls.iter().enumerate() {
         // Find the tool by name now (cheap) so the task owns an `Arc<dyn Tool>`.
@@ -668,38 +724,55 @@ async fn execute_tool_calls(
             };
             (i, result)
         });
-        // Cap concurrency by waiting for a slot to clear.
+        // Cap concurrency by waiting for a slot to clear. Every drained result
+        // must be recorded (the throttle and final-collection loops share one
+        // recorder so nothing is dropped).
         while set.len() >= tool_concurrency {
-            // We must not stall forever if a task panics; JoinSet aborts on drop.
-            if set.join_next().await.is_none() {
-                break;
+            let res = set.join_next().await;
+            if res.is_none() {
+                break; // set drained (all spawned tasks already completed)
             }
+            record_join_result(res, &mut indexed);
         }
     }
-    // Collect and re-order by original index.
+    // Collect any remaining results, re-ordered by original index.
     //
     // A spawned task can panic (JoinSet swallows panics, returning `Err` from
     // `join_next`). We must still return exactly `calls.len()` results so the
     // caller's `results[i]` indexing can never panic. Missing/failed slots are
     // filled with an error result.
-    let mut indexed: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
     while let Some(res) = set.join_next().await {
-        match res {
-            Ok((i, result)) => indexed[i] = Some(result),
-            Err(join_err) => {
-                // Task panicked or was cancelled. Find its slot and fill it.
-                // `join_next` on a panic doesn't report the index, so we fill
-                // the first still-empty slot.
-                let slot = indexed.iter().position(Option::is_none).unwrap_or(0);
-                indexed[slot] = Some(error_result(&format!("tool task failed: {join_err}")));
-            }
-        }
+        record_join_result(Some(res), &mut indexed);
     }
     indexed
         .into_iter()
         .map(|opt| opt.unwrap_or_else(|| error_result("tool task produced no result")))
         // Order is already correct (indexed by position); this is a no-op guard.
         .collect()
+}
+
+/// Record a `JoinSet::join_next()` outcome into the indexed results vec. Used
+/// by both the throttling loop and the final collection so no result is
+/// dropped. On a panic/cancel (`Err`) we fill the first still-empty slot
+/// (`join_next` on a panic doesn't report the index).
+fn record_join_result(
+    res: Option<std::result::Result<(usize, ToolResult), tokio::task::JoinError>>,
+    indexed: &mut [Option<ToolResult>],
+) {
+    match res {
+        Some(Ok((i, result))) => {
+            if let Some(slot) = indexed.get_mut(i) {
+                *slot = Some(result);
+            }
+        }
+        Some(Err(join_err)) => {
+            let slot = indexed.iter().position(Option::is_none).unwrap_or(0);
+            if let Some(s) = indexed.get_mut(slot) {
+                *s = Some(error_result(&format!("tool task failed: {join_err}")));
+            }
+        }
+        None => {}
+    }
 }
 
 /// Build a `ToolResult` carrying a single error text block.
@@ -1244,6 +1317,167 @@ mod tests {
             tool_ids,
             vec!["c1", "c2"],
             "both results must be present despite the panic: {tool_ids:?}"
+        );
+    }
+
+    /// The DEFAULT (sequential, `tool_concurrency == 1`) path must ALSO survive
+    /// a tool panic — converted to a model-visible `Error:` result, not an
+    /// aborting unwind. This is the gap the dev-config-UX red-team flagged:
+    /// the parallel path had JoinSet panic isolation, but the sequential path
+    /// (the default) did not until `execute_tool_call` grew `catch_unwind`.
+    #[tokio::test]
+    async fn sequential_path_survives_a_tool_panic() {
+        let turn = vec![
+            assistant_tool_use("c1", "boom", json!({})),
+            assistant_tool_use("c2", "echo", json!({ "text": "survived" })),
+        ];
+        let provider = MockProvider::new(vec![turn, vec![assistant_text("done")]]);
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(PanickingTool), Arc::new(EchoTool)];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call both")];
+        // tool_concurrency == 1 → sequential path (the default).
+        let config = RunConfig::default();
+
+        // This must not panic.
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &config,
+            &CancellationToken::new(),
+            &RunHooks::default(),
+        )
+        .await
+        .expect("sequential path must survive a tool panic");
+        assert_eq!(outcome.final_text, "done");
+
+        // Both Tool results present, in issued order.
+        let results: Vec<&ContentBlock> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .flat_map(|m| m.content.iter())
+            .collect();
+        assert_eq!(results.len(), 2, "both results appended");
+        // c1 (the panic) → contains Error: + panicked; c2 (echo) → the echoed text.
+        let c1_str = match &results[0] {
+            ContentBlock::ToolResult { content, .. } => content.to_string(),
+            _ => String::new(),
+        };
+        assert!(
+            c1_str.contains("Error:"),
+            "panic must surface as an Error: result, got: {c1_str}"
+        );
+        assert!(
+            c1_str.contains("panicked"),
+            "error result should mention the panic: {c1_str}"
+        );
+    }
+
+    /// Regression test for a pre-existing bug in the parallel path: the
+    /// throttling loop (`while set.len() >= tool_concurrency { join_next }`)
+    /// used to **discard** the drained result, so when `calls.len()` exceeded
+    /// `tool_concurrency`, early-completing results were lost and the run
+    /// ended up with "produced no result" error results in their slots. The
+    /// fix records every `join_next` via a shared recorder.
+    #[tokio::test]
+    async fn parallel_path_keeps_all_results_under_throttling() {
+        // 3 calls, concurrency = 2 → the throttle loop must drain-and-record
+        // (not drain-and-drop) the first task that completes while the third
+        // is waiting for a slot.
+        let turn = vec![
+            assistant_tool_use("c1", "echo", json!({ "text": "one" })),
+            assistant_tool_use("c2", "echo", json!({ "text": "two" })),
+            assistant_tool_use("c3", "echo", json!({ "text": "three" })),
+        ];
+        let provider = MockProvider::new(vec![turn, vec![assistant_text("done")]]);
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call all three")];
+        let config = RunConfig {
+            tool_concurrency: 2,
+            ..RunConfig::default()
+        };
+
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &config,
+            &CancellationToken::new(),
+            &RunHooks::default(),
+        )
+        .await
+        .expect("run completes");
+        assert_eq!(outcome.final_text, "done");
+
+        // All three Tool results must be present, in issued order, with the
+        // correct echoed text in each slot (proving the RIGHT result landed,
+        // not a placeholder).
+        let results: Vec<String> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                } => {
+                    let text = content
+                        .get("content")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("<missing>");
+                    Some(format!("{tool_use_id}={text}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec!["c1=echo: one", "c2=echo: two", "c3=echo: three"],
+            "all 3 results must survive throttling, in order, with correct text: {results:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_panic_handles_string_payloads() {
+        let p: Box<dyn std::any::Any + Send> = Box::new("boom!".to_string());
+        assert_eq!(summarize_panic(&p), "boom!");
+    }
+
+    #[test]
+    fn summarize_panic_handles_str_payloads() {
+        let s: &'static str = "static boom";
+        let p: Box<dyn std::any::Any + Send> = Box::new(s);
+        assert_eq!(summarize_panic(&p), "static boom");
+    }
+
+    #[test]
+    fn summarize_panic_bounds_huge_payloads() {
+        let huge = "x".repeat(10_000);
+        let p: Box<dyn std::any::Any + Send> = Box::new(huge);
+        let summary = summarize_panic(&p);
+        assert!(
+            summary.chars().count() <= PANIC_SUMMARY_MAX_CHARS,
+            "summary not bounded: {} chars",
+            summary.chars().count()
+        );
+        assert!(
+            summary.ends_with('…'),
+            "should end with ellipsis: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_panic_falls_back_for_non_string_payloads() {
+        let p: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        let summary = summarize_panic(&p);
+        assert!(
+            summary.contains("non-string"),
+            "expected fallback marker: {summary}"
         );
     }
 
