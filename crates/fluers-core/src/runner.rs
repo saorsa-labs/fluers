@@ -714,12 +714,31 @@ async fn execute_tool_calls(
         };
         let input = call.input.clone();
         let id_owned = id.clone();
+        let call_name = call.name.clone();
         set.spawn(async move {
+            // Catch panics INSIDE the task so the original index `i` is
+            // preserved and the bounded summary reaches the model. (Previously
+            // the task could panic, and JoinSet::join_next would return Err
+            // with no index — record_join_result would fill the first empty
+            // slot, attributing the panic to the wrong call_id.)
             let result = match tool {
-                Some(t) => match t.execute(ctx, input).await {
-                    Ok(r) => r,
-                    Err(err) => error_result(&err.to_string()),
-                },
+                Some(t) => {
+                    use futures::FutureExt;
+                    use std::panic::AssertUnwindSafe;
+                    match AssertUnwindSafe(t.execute(ctx, input)).catch_unwind().await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(err)) => error_result(&err.to_string()),
+                        Err(payload) => {
+                            let summary = summarize_panic(&payload);
+                            tracing::warn!(
+                                tool = %call_name,
+                                call_id = %id_owned,
+                                "tool panicked; converted to model-visible error result"
+                            );
+                            error_result(&format!("tool `{call_name}` panicked: {summary}"))
+                        }
+                    }
+                }
                 None => error_result(&format!("unknown tool: `{id_owned}`")),
             };
             (i, result)
@@ -1371,6 +1390,71 @@ mod tests {
         assert!(
             c1_str.contains("panicked"),
             "error result should mention the panic: {c1_str}"
+        );
+    }
+
+    /// Parallel-path panics must be attributed to the CORRECT call_id (not the
+    /// first empty slot) and carry the bounded panic summary — matching the
+    /// sequential path's quality. Before the fix, the task could panic, and
+    /// JoinSet::join_next returned Err with no index, so record_join_result
+    /// filled the first empty slot with a generic 'tool task failed' message.
+    #[tokio::test]
+    async fn parallel_path_panic_preserves_call_id_and_summary() {
+        // c1 → boom (panics); c2 → echo (succeeds). Both run in parallel.
+        let turn = vec![
+            assistant_tool_use("c1", "boom", json!({})),
+            assistant_tool_use("c2", "echo", json!({ "text": "ok" })),
+        ];
+        let provider = MockProvider::new(vec![turn, vec![assistant_text("done")]]);
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(PanickingTool), Arc::new(EchoTool)];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call both")];
+        let config = RunConfig {
+            tool_concurrency: 4,
+            ..RunConfig::default()
+        };
+
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &config,
+            &CancellationToken::new(),
+            &RunHooks::default(),
+        )
+        .await
+        .expect("run survives parallel panic");
+        assert_eq!(outcome.final_text, "done");
+
+        // c1 (the panic) must be in the FIRST slot with a 'panicked' summary,
+        // NOT a generic 'tool task failed'. c2 (echo) in the second slot.
+        let tool_msgs: Vec<(&String, String)> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                } => Some((tool_use_id, content.to_string())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "both results present");
+        // Correct call_id attribution (c1 first, c2 second).
+        assert_eq!(tool_msgs[0].0, "c1", "c1 attributed correctly");
+        assert_eq!(tool_msgs[1].0, "c2", "c2 attributed correctly");
+        // The panic carries the bounded summary (not the generic message).
+        assert!(
+            tool_msgs[0].1.contains("panicked"),
+            "parallel panic should carry bounded summary, got: {}",
+            tool_msgs[0].1
+        );
+        assert!(
+            tool_msgs[0].1.contains("Error:"),
+            "should be an Error: result, got: {}",
+            tool_msgs[0].1
         );
     }
 

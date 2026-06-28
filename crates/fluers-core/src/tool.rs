@@ -70,6 +70,16 @@ pub struct ToolDefinition {
 ///
 /// Flue's `AgentTool` is an object with a `parameters` schema and an async
 /// `execute`. The Rust equivalent is this trait, wrapped in `Arc<dyn Tool>`.
+///
+/// # Panic safety (precondition)
+///
+/// `run_agent` wraps `execute` in `catch_unwind` so a panicking tool is
+/// converted to a model-visible `Error:` result rather than aborting the run.
+/// For this to be sound, a tool's interior mutability must be **poison-free**
+/// (use `parking_lot` / atomics / `tokio::sync`, not `std::sync::Mutex`/
+/// `RwLock`, which poison on panic). A tool left mid-mutation by an unwinding
+/// panic must still be safely callable on subsequent turns. The built-in tools
+/// and `TaskTool` satisfy this.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// The static definition (name/schema/description).
