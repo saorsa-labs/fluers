@@ -425,8 +425,11 @@ impl<'a> ChatRequest<'a> {
     }
 }
 
-/// A single chat message in OpenAI wire format.
-#[derive(Serialize, Deserialize)]
+/// A single chat message in OpenAI wire format (SEND only).
+///
+/// Response parsing uses separate structs ([`ChatResponse`] / [`Choice`] /
+/// [`RespMessage`]); this struct is never deserialized.
+#[derive(Serialize)]
 struct WireMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,10 +462,12 @@ impl WireMessage {
                     .iter()
                     .filter_map(|b| match b {
                         ContentBlock::ToolUse { id, call } => Some(WireToolCall {
+                            kind: "function",
                             id: id.clone(),
                             function: WireFunction {
                                 name: call.name.clone(),
-                                arguments: call.input.clone(),
+                                arguments: serde_json::to_string(&call.input)
+                                    .unwrap_or_else(|_| "{}".into()),
                             },
                         }),
                         _ => None,
@@ -562,18 +567,27 @@ struct WireToolDef {
     parameters: Value,
 }
 
-/// A tool call in the response.
-#[derive(Serialize, Deserialize)]
+/// A tool call in the request (serialized into assistant messages).
+///
+/// NOTE: this is the SEND format only. Receiving tool calls from responses
+/// uses separate structs ([`RespToolCall`] / [`StreamToolCallDelta`]) that
+/// handle the response format correctly. The OpenAI spec requires both
+/// `type: "function"` on the call and `arguments` as a JSON **string**;
+/// strict servers (e.g. llama-server) reject requests missing either.
+#[derive(Serialize)]
 struct WireToolCall {
+    #[serde(rename = "type")]
+    kind: &'static str,
     id: String,
     function: WireFunction,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct WireFunction {
     name: String,
-    /// OpenAI sends this as a JSON *string*; we accept both string and object.
-    arguments: Value,
+    /// OpenAI requires this as a JSON-encoded **string**, not a raw object.
+    /// OpenRouter tolerates objects, but strict servers reject them.
+    arguments: String,
 }
 
 /// The OpenAI chat-completions response body.
@@ -686,4 +700,53 @@ struct StreamToolCallDelta {
 struct StreamToolFunctionDelta {
     name: Option<String>,
     arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluers_core::message::{AgentMessage, ContentBlock, Role};
+    use fluers_core::tool::ToolCall;
+
+    #[test]
+    fn wire_tool_call_has_type_function_and_string_arguments() {
+        // Strict OpenAI-compatible servers (e.g. llama-server) reject tool
+        // calls that lack `type: "function"` or that send `arguments` as a
+        // raw object instead of a JSON string.
+        let msg = AgentMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                call: ToolCall {
+                    name: "read".into(),
+                    input: serde_json::json!({ "path": "local.rs" }),
+                },
+            }],
+        };
+        let wire = WireMessage::from_message(&msg);
+        let json = serde_json::to_value(&wire).expect("serialize");
+        let tc = json
+            .get("tool_calls")
+            .and_then(|c| c.get(0))
+            .expect("tool call present");
+
+        // type: "function" present and correct.
+        assert_eq!(
+            tc.get("type").and_then(|v| v.as_str()),
+            Some("function"),
+            "missing/wrong type field: {tc}"
+        );
+        // arguments is a JSON STRING (not a raw object).
+        let args = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|a| a.as_str())
+            .expect("arguments should be a string");
+        let parsed: serde_json::Value =
+            serde_json::from_str(args).expect("arguments parses as JSON");
+        assert_eq!(
+            parsed.get("path").and_then(|v| v.as_str()),
+            Some("local.rs")
+        );
+    }
 }

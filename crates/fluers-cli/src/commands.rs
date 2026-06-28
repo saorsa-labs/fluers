@@ -298,8 +298,17 @@ fn build_provider(args: &RunArgs) -> anyhow::Result<OpenAiCompatibleProvider> {
                 .clone()
                 .unwrap_or_else(|| "OPENAI_API_KEY".into());
             let key = std::env::var(&envvar).unwrap_or_default();
-            Ok(OpenAiCompatibleProvider::try_new(url, key, envvar)
-                .map_err(|e| anyhow::anyhow!("{e}"))?)
+            // Local servers (llama-server, etc.) need no key: use `new` (no
+            // empty-key check) when the host is localhost/127.0.0.1, so users
+            // don't need to set a dummy env var. Remote hosts still require a
+            // real key.
+            let is_local = url.contains("127.0.0.1") || url.contains("localhost");
+            if is_local && key.trim().is_empty() {
+                Ok(OpenAiCompatibleProvider::new(url, "local-no-key"))
+            } else {
+                Ok(OpenAiCompatibleProvider::try_new(url, key, envvar)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?)
+            }
         }
         other => Err(anyhow::anyhow!(
             "unknown provider `{other}` (openrouter|minimax|custom)"
