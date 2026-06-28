@@ -511,7 +511,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fluers-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-mcp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fluers-core",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-memory"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fluers-core",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-otel"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fluers-core",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-postgres"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fluers-core",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-protocol"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-providers"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-runtime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-sdk"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "fluers-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
