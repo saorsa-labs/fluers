@@ -217,7 +217,7 @@ pub(crate) struct DevArgs {
     /// static-tools agent.
     #[arg(long)]
     pub config: Option<PathBuf>,
-    /// Name of the agent to serve (from `[agents.<name>]`). Defaults to
+    /// Name of the agent to run (from `[agents.<name>]`). Defaults to
     /// `"default"`. Only used when the config declares agents.
     #[arg(long)]
     pub agent: Option<String>,
@@ -753,53 +753,13 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
     let env: Arc<dyn fluers_runtime::SessionEnv> =
         Arc::new(LocalSessionEnv::new(&workdir, Limits::default()).await?);
 
-    // Build the agent handle. Two paths:
-    //  - config declares agents: resolve the spec once, install a per-request
-    //    ToolFactory (so MCP tools + a request-local `task` tool are built fresh
-    //    per request, keeping cancellation / events / budgets isolated).
-    //  - legacy: static builtins, no factory.
-    let (tool_factory, static_tools, system_prompt, description) = if cfg.has_agents() {
-        let agent_name = args.agent.as_deref().unwrap_or("default");
-        let builtin = if args.no_tools {
-            Vec::new()
-        } else {
-            fluers_runtime::mvp_tools(env.clone())
-        };
-        let spec = Arc::new(
-            crate::agent_config::resolve_agent_spec(&cfg, agent_name, builtin, env.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("agent config: {e}"))?,
-        );
-        let sys = spec
-            .instructions
-            .clone()
-            .unwrap_or_else(|| "You are a Fluers agent.".into());
-        let desc = spec
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("{agent_name} agent"));
-        // The factory captures the spec by Arc; each request builds a fresh
-        // tool list (static tools + a request-local TaskTool). The provider /
-        // model / config are supplied by `tools_for_request` from the handle.
-        let spec_for_factory = Arc::clone(&spec);
-        let factory: fluers_core::ToolFactory =
-            Arc::new(move |ctx| spec_for_factory.tools_for_run(ctx));
-        (Some(factory), Vec::new(), sys, desc)
-    } else {
-        let tools = if args.no_tools {
-            Vec::new()
-        } else {
-            fluers_runtime::mvp_tools(env.clone())
-        };
-        (
-            None,
-            tools,
-            "You are a Fluers agent. Use the provided tools when they help. \
-             Paths are relative to the working directory. Be concise."
-                .into(),
-            "default Fluers agent".into(),
-        )
-    };
+    // Build the agent handle(s). Two paths:
+    //  - config declares agents: resolve EVERY agent's spec, install a
+    //    per-request ToolFactory for each (MCP tools + request-local `task`).
+    //    Each agent is registered under its config name.
+    //  - legacy: one static-tools agent under "default".
+    let is_config_mode = cfg.has_agents();
+    let mut registered_names: Vec<String> = Vec::new();
 
     let sessions: Arc<dyn fluers_runtime::PersistenceAdapter> =
         if let Some(url) = args.database_url.as_ref() {
@@ -819,25 +779,75 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
             Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir))
         };
     let state = Arc::new(fluers_server::ServerState::new(sessions));
+
     // Honor config-level budgets (max_turns / turn_timeout_ms / tool_concurrency)
-    // so the served agent matches `fluers run` semantics.
-    let config = RunConfig {
+    // so the served agents match `fluers run` semantics.
+    let run_config = RunConfig {
         max_turns: cfg.max_turns.unwrap_or(12),
         turn_timeout_ms: cfg.turn_timeout_ms.or(Some(120_000)),
         tool_concurrency: cfg.tool_concurrency.unwrap_or(1),
         ..Default::default()
     };
-    let is_config_mode = cfg.has_agents();
-    let handle = fluers_server::AgentHandle {
-        provider,
-        model,
-        tools: static_tools,
-        tool_factory,
-        config,
-        system_prompt,
-        description,
-    };
-    state.register("default", handle);
+
+    if is_config_mode {
+        // Multi-agent: resolve and register every declared agent.
+        for name in cfg.agents.keys() {
+            let builtin = if args.no_tools {
+                Vec::new()
+            } else {
+                fluers_runtime::mvp_tools(env.clone())
+            };
+            let spec = Arc::new(
+                crate::agent_config::resolve_agent_spec(&cfg, name, builtin, env.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("agent config for `{name}`: {e}"))?,
+            );
+            let system_prompt = spec
+                .instructions
+                .clone()
+                .unwrap_or_else(|| "You are a Fluers agent.".into());
+            let description = spec
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("{name} agent"));
+            // The factory captures the spec by Arc; each request builds a fresh
+            // tool list (static tools + a request-local TaskTool).
+            let spec_for_factory = Arc::clone(&spec);
+            let factory: fluers_core::ToolFactory =
+                Arc::new(move |ctx| spec_for_factory.tools_for_run(ctx));
+            let handle = fluers_server::AgentHandle {
+                provider: Arc::clone(&provider),
+                model: model.clone(),
+                tools: Vec::new(),
+                tool_factory: Some(factory),
+                config: run_config.clone(),
+                system_prompt,
+                description,
+            };
+            state.register(name.clone(), handle);
+            registered_names.push(name.clone());
+        }
+    } else {
+        // Legacy: static builtins, no factory, single "default" agent.
+        let tools = if args.no_tools {
+            Vec::new()
+        } else {
+            fluers_runtime::mvp_tools(env.clone())
+        };
+        let handle = fluers_server::AgentHandle {
+            provider,
+            model,
+            tools,
+            tool_factory: None,
+            config: run_config,
+            system_prompt: "You are a Fluers agent. Use the provided tools when they help. \
+             Paths are relative to the working directory. Be concise."
+                .into(),
+            description: "default Fluers agent".into(),
+        };
+        state.register("default", handle);
+        registered_names.push("default".into());
+    }
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     eprintln!("→ fluers dev server");
@@ -850,8 +860,10 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
     eprintln!("  endpoints:");
     eprintln!("    GET    /health");
     eprintln!("    GET    /agents");
-    eprintln!("    POST   /agents/default/invoke");
-    eprintln!("    POST   /agents/default/stream");
+    for name in &registered_names {
+        eprintln!("    POST   /agents/{name}/invoke");
+        eprintln!("    POST   /agents/{name}/stream");
+    }
     eprintln!("    GET    /runs/{{run_id}}");
     fluers_server::serve(addr, state).await
 }

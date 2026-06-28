@@ -691,4 +691,87 @@ mod tests {
             seen_tools.lock()
         );
     }
+
+    #[tokio::test]
+    async fn multiple_agents_registered_and_independently_invocable() {
+        // Two agents registered under different names: each is invocable at
+        // its own /agents/<name>/invoke route and returns its own output.
+        let dir = tempfile::tempdir().unwrap();
+        let adapter: Arc<dyn PersistenceAdapter> = Arc::new(JsonFileAdapter::new(dir.path()));
+        let state = Arc::new(ServerState::new(adapter));
+
+        let mk_handle = |text: &str| AgentHandle {
+            provider: Arc::new(EchoStreamProvider {
+                chunks: vec![text.into()],
+            }),
+            model: fluers_core::Model::new("mock/echo"),
+            tools: vec![],
+            tool_factory: None,
+            config: RunConfig {
+                max_turns: 1,
+                ..Default::default()
+            },
+            system_prompt: "test".into(),
+            description: text.into(),
+        };
+        state.register("alpha", mk_handle("alpha says hi"));
+        state.register("beta", mk_handle("beta says hello"));
+
+        let app = router(state);
+        use tower::ServiceExt;
+
+        // GET /agents returns both.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agents")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let infos: Vec<AgentInfo> = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "alpha missing: {names:?}");
+        assert!(names.contains(&"beta"), "beta missing: {names:?}");
+
+        // Invoke alpha.
+        let req = InvokeRequest {
+            prompt: "hi".into(),
+            session_id: None,
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agents/alpha/invoke")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let resp: InvokeResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.output, "alpha says hi");
+
+        // Invoke beta — different output proves independent agents.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agents/beta/invoke")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let resp: InvokeResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.output, "beta says hello");
+    }
 }
