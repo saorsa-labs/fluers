@@ -102,6 +102,24 @@ impl SessionEnv for LocalSessionEnv {
         Ok(apply_read_limits(raw, max_lines, max_bytes))
     }
 
+    async fn read_file_full(&self, path: &Path, max_bytes: usize) -> RuntimeResult<String> {
+        let resolved = self.resolve(path)?;
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(RuntimeError::Io)?;
+        let size = meta.len() as usize;
+        if size > max_bytes {
+            return Err(RuntimeError::FileTooLarge {
+                path: path.display().to_string(),
+                size,
+                max: max_bytes,
+            });
+        }
+        tokio::fs::read_to_string(&resolved)
+            .await
+            .map_err(RuntimeError::Io)
+    }
+
     async fn write_file(&self, path: &Path, content: &str) -> RuntimeResult<()> {
         let resolved = self.resolve(path)?;
         if let Some(parent) = resolved.parent() {
@@ -387,6 +405,71 @@ mod tests {
             .unwrap();
         let res = env.read_file(Path::new("../escape.txt"), 100, 1024).await;
         assert!(res.is_err(), "`..` must be rejected");
+    }
+
+    #[tokio::test]
+    async fn read_file_full_returns_complete_content_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        // 10 lines of 60 bytes each = 600 bytes, well under the default cap,
+        // but above the *truncating* read's line/byte interplay. Ensure the
+        // full-read path returns the whole file verbatim, with no marker.
+        let body = (0..10)
+            .map(|i| format!("line number {i:02} with some padding text\n"))
+            .collect::<String>();
+        tokio::fs::write(dir.path().join("big.txt"), &body)
+            .await
+            .unwrap();
+        let got = env
+            .read_file_full(Path::new("big.txt"), 1024)
+            .await
+            .unwrap();
+        assert_eq!(got, body);
+        assert!(!got.contains("[... truncated"));
+    }
+
+    #[tokio::test]
+    async fn read_file_full_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env.read_file_full(Path::new("/etc/passwd"), 1024).await;
+        assert!(res.is_err(), "absolute paths must be rejected");
+    }
+
+    #[tokio::test]
+    async fn read_file_full_rejects_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env.read_file_full(Path::new("../escape.txt"), 1024).await;
+        assert!(res.is_err(), "`..` must be rejected");
+    }
+
+    #[tokio::test]
+    async fn read_file_full_errors_when_too_large_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        // 100 bytes, cap at 50 -> must ERROR (FileTooLarge), never return a
+        // truncated prefix (the whole point vs `read_file`).
+        tokio::fs::write(dir.path().join("over.txt"), &"a".repeat(100))
+            .await
+            .unwrap();
+        let res = env.read_file_full(Path::new("over.txt"), 50).await;
+        assert!(res.is_err(), "oversized file must error, not truncate");
+        match res {
+            Err(RuntimeError::FileTooLarge { size, max, .. }) => {
+                assert_eq!(size, 100);
+                assert_eq!(max, 50);
+            }
+            other => panic!("expected FileTooLarge, got {other:?}"),
+        }
     }
 
     #[tokio::test]

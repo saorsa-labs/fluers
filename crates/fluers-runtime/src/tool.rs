@@ -19,11 +19,10 @@ use fluers_core::Result;
 use crate::env::{Limits, SessionEnv};
 use crate::error::RuntimeError;
 
-/// Build the MVP toolset over `env`: `read`, `write`, `bash`, `glob`, `grep`.
+/// Build the MVP toolset over `env`: `read`, `write`, `edit`, `bash`, `glob`, `grep`.
 ///
 /// Each tool captures the env (and the resource [`Limits`]) so it can execute
-/// sandboxed operations. `edit` arrives in a later phase (string-replace
-/// matching is fiddly enough to warrant its own iteration).
+/// sandboxed operations.
 #[must_use]
 pub fn mvp_tools(env: Arc<dyn SessionEnv>) -> Vec<Arc<dyn Tool>> {
     mvp_tools_with_limits(env, Limits::default())
@@ -35,6 +34,7 @@ pub fn mvp_tools_with_limits(env: Arc<dyn SessionEnv>, limits: Limits) -> Vec<Ar
     vec![
         Arc::new(ReadTool::new(env.clone(), limits)),
         Arc::new(WriteTool::new(env.clone(), limits)),
+        Arc::new(EditTool::new(env.clone(), limits)),
         Arc::new(BashTool::new(env.clone(), limits)),
         Arc::new(GlobTool::new(env.clone())),
         Arc::new(GrepTool::new(env)),
@@ -175,8 +175,102 @@ impl Tool for WriteTool {
 }
 
 // ---------------------------------------------------------------------------
-// bash
+// edit
 // ---------------------------------------------------------------------------
+
+/// `edit` — replace a **unique** snippet in a file.
+///
+/// `old_text` must occur exactly once in the file; the tool errors if it is
+/// absent (no-op risk) or ambiguous (>1 match). Reads the file in full via
+/// [`SessionEnv::read_file_full`] so an oversized file is **rejected** rather
+/// than silently truncated (which would lose data on write-back).
+pub struct EditTool {
+    env: Arc<dyn SessionEnv>,
+    limits: Limits,
+    def: ToolDefinition,
+}
+
+impl EditTool {
+    /// Construct an `edit` tool bound to `env` with the given `limits`.
+    #[must_use]
+    pub fn new(env: Arc<dyn SessionEnv>, limits: Limits) -> Self {
+        let def = ToolDefinition {
+            name: "edit".into(),
+            label: "Edit File".into(),
+            description:
+                "Replace a unique snippet in a file. `old_text` must match exactly one place."
+                    .into(),
+            parameters: ParameterSchema {
+                fields: json_schema(&[
+                    ("path", "string", true),
+                    ("old_text", "string", true),
+                    ("new_text", "string", true),
+                ]),
+            },
+        };
+        Self { env, limits, def }
+    }
+}
+
+#[async_trait]
+impl Tool for EditTool {
+    fn definition(&self) -> ToolDefinition {
+        self.def.clone()
+    }
+
+    async fn execute(&self, _ctx: InvokeContext, input: JsonValue) -> Result<ToolResult> {
+        validate_input(&self.def, &input)?;
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::ToolInputValidation("edit: `path` required".into()))?;
+        let old_text = input
+            .get("old_text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::ToolInputValidation("edit: `old_text` required".into()))?;
+        let new_text = input
+            .get("new_text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::ToolInputValidation("edit: `new_text` required".into()))?;
+        if old_text.is_empty() {
+            return Err(CoreError::ToolInputValidation(
+                "edit: `old_text` must be non-empty".into(),
+            ));
+        }
+        let content = self
+            .env
+            .read_file_full(&PathBuf::from(path), self.limits.max_edit_bytes)
+            .await
+            .map_err(|e| CoreError::ToolOutput(e.to_string()))?;
+        let occurrences = content.matches(old_text).count();
+        if occurrences == 0 {
+            return Err(CoreError::ToolInputValidation(format!(
+                "edit: `old_text` not found in `{path}`"
+            )));
+        }
+        if occurrences > 1 {
+            return Err(CoreError::ToolInputValidation(format!(
+                "edit: `old_text` matches {occurrences} places in `{path}`; it must be unique"
+            )));
+        }
+        let updated = content.replacen(old_text, new_text, 1);
+        self.env
+            .write_file(&PathBuf::from(path), &updated)
+            .await
+            .map_err(|e| CoreError::ToolOutput(e.to_string()))?;
+        Ok(ToolResult {
+            content: vec![json!({
+                "type": "text",
+                "text": format!("Edited `{}` ({} -> {} bytes)", path, content.len(), updated.len())
+            })],
+            details: Some(json!({
+                "path": path,
+                "old_bytes": content.len(),
+                "new_bytes": updated.len()
+            })),
+        })
+    }
+}
 
 /// `bash` — run a shell command in the sandbox.
 pub struct BashTool {
@@ -381,4 +475,149 @@ fn json_schema(props: &[(&str, &str, bool)]) -> std::collections::BTreeMap<Strin
     fields.insert("properties".into(), Value::Object(properties));
     fields.insert("required".into(), Value::Array(required));
     fields
+}
+
+#[cfg(test)]
+mod edit_tests {
+    //! `edit` tool semantics: unique-match replace + data-loss safety.
+    use super::*;
+    use crate::LocalSessionEnv;
+    use std::path::Path;
+    use tokio_util::sync::CancellationToken;
+
+    fn ctx() -> InvokeContext {
+        InvokeContext {
+            tool_call_id: "t1".into(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_unique_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        env.write_file(Path::new("a.txt"), "hello world")
+            .await
+            .unwrap();
+        let tool = EditTool::new(env.clone(), Limits::default());
+        let input = json!({"path":"a.txt","old_text":"world","new_text":"moon"});
+        tool.execute(ctx(), input).await.unwrap();
+        let after = env.read_file(Path::new("a.txt"), 100, 1024).await.unwrap();
+        assert_eq!(after, "hello moon");
+    }
+
+    #[tokio::test]
+    async fn edit_errors_when_old_text_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        env.write_file(Path::new("a.txt"), "hello").await.unwrap();
+        let tool = EditTool::new(env, Limits::default());
+        let input = json!({"path":"a.txt","old_text":"xyz","new_text":"abc"});
+        let res = tool.execute(ctx(), input).await;
+        assert!(matches!(res, Err(CoreError::ToolInputValidation(_))));
+    }
+
+    #[tokio::test]
+    async fn edit_errors_when_old_text_not_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        env.write_file(Path::new("a.txt"), "ha ha ha")
+            .await
+            .unwrap();
+        let tool = EditTool::new(env, Limits::default());
+        let input = json!({"path":"a.txt","old_text":"ha","new_text":"ho"});
+        let res = tool.execute(ctx(), input).await;
+        assert!(matches!(res, Err(CoreError::ToolInputValidation(_))));
+    }
+
+    #[tokio::test]
+    async fn edit_errors_when_old_text_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        env.write_file(Path::new("a.txt"), "hello").await.unwrap();
+        let tool = EditTool::new(env, Limits::default());
+        let input = json!({"path":"a.txt","old_text":"","new_text":"x"});
+        let res = tool.execute(ctx(), input).await;
+        assert!(matches!(res, Err(CoreError::ToolInputValidation(_))));
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        env.write_file(Path::new("a.txt"), "hello").await.unwrap();
+        let tool = EditTool::new(env, Limits::default());
+        // `..` is rejected at the env containment seam (resolve), before any edit.
+        let input = json!({"path":"../escape.txt","old_text":"x","new_text":"y"});
+        let res = tool.execute(ctx(), input).await;
+        assert!(res.is_err(), "path escape must be rejected");
+    }
+
+    #[tokio::test]
+    async fn edit_round_trips_multiline_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        let body = "line one\nTODO: fix me\nline three\n";
+        env.write_file(Path::new("m.txt"), body).await.unwrap();
+        let tool = EditTool::new(env.clone(), Limits::default());
+        let input = json!({"path":"m.txt","old_text":"TODO: fix me\nline three","new_text":"DONE\nline three"});
+        tool.execute(ctx(), input).await.unwrap();
+        let after = env.read_file(Path::new("m.txt"), 100, 1024).await.unwrap();
+        assert_eq!(after, "line one\nDONE\nline three\n");
+    }
+
+    #[tokio::test]
+    async fn edit_errors_when_file_too_large_and_does_not_destroy() {
+        // The data-loss-safety guarantee: an oversized file is REJECTED by
+        // read_file_full (FileTooLarge), never silently truncated + written
+        // back. The original content must survive untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let env: Arc<dyn SessionEnv> = Arc::new(
+            LocalSessionEnv::new(dir.path(), Limits::default())
+                .await
+                .unwrap(),
+        );
+        let original = "a".repeat(100);
+        env.write_file(Path::new("big.txt"), &original)
+            .await
+            .unwrap();
+        let small_cap = Limits {
+            max_edit_bytes: 50,
+            ..Limits::default()
+        };
+        let tool = EditTool::new(env.clone(), small_cap);
+        let input = json!({"path":"big.txt","old_text":"a","new_text":"b"});
+        let res = tool.execute(ctx(), input).await;
+        assert!(matches!(res, Err(CoreError::ToolOutput(_))));
+        // Content is intact — no truncation, no partial write-back.
+        let after = env
+            .read_file(Path::new("big.txt"), 1000, 4096)
+            .await
+            .unwrap();
+        assert_eq!(after, original);
+    }
 }

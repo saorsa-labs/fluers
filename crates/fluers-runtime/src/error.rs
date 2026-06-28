@@ -35,6 +35,20 @@ pub enum RuntimeError {
     /// An I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// A file was too large for a non-truncating read (e.g. `edit`).
+    ///
+    /// Distinct from a truncated `read`: tools that must operate on the
+    /// complete file (write-back) get an error instead of silent data loss.
+    #[error("file `{path}` is {size} bytes, exceeds max {max} bytes")]
+    FileTooLarge {
+        /// The path that was too large (as supplied to the read call).
+        path: String,
+        /// The file's actual size in bytes.
+        size: usize,
+        /// The byte cap that was exceeded.
+        max: usize,
+    },
 }
 
 impl From<crate::persistence::PersistenceError> for RuntimeError {
