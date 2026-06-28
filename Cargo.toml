@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
@@ -99,15 +99,15 @@ parking_lot = "0.12"
 tempfile = "3"
 
 # Internal crates
-fluers-core = { path = "crates/fluers-core", version = "0.2.0" }
-fluers-runtime = { path = "crates/fluers-runtime", version = "0.2.0" }
-fluers-providers = { path = "crates/fluers-providers", version = "0.2.0" }
-fluers-protocol = { path = "crates/fluers-protocol", version = "0.2.0" }
-fluers-server = { path = "crates/fluers-server", version = "0.2.0" }
-fluers-postgres = { path = "crates/fluers-postgres", version = "0.2.0" }
-fluers-memory = { path = "crates/fluers-memory", version = "0.2.0" }
-fluers-otel = { path = "crates/fluers-otel", version = "0.2.0" }
-fluers-mcp = { path = "crates/fluers-mcp", version = "0.2.0" }
+fluers-core = { path = "crates/fluers-core", version = "0.2.1" }
+fluers-runtime = { path = "crates/fluers-runtime", version = "0.2.1" }
+fluers-providers = { path = "crates/fluers-providers", version = "0.2.1" }
+fluers-protocol = { path = "crates/fluers-protocol", version = "0.2.1" }
+fluers-server = { path = "crates/fluers-server", version = "0.2.1" }
+fluers-postgres = { path = "crates/fluers-postgres", version = "0.2.1" }
+fluers-memory = { path = "crates/fluers-memory", version = "0.2.1" }
+fluers-otel = { path = "crates/fluers-otel", version = "0.2.1" }
+fluers-mcp = { path = "crates/fluers-mcp", version = "0.2.1" }
 
 [profile.release]
 lto = "thin"
