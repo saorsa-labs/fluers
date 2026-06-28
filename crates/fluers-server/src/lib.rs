@@ -152,6 +152,7 @@ async fn invoke(
         session_id: Some(session_id),
         turn_sink: Some(runner.as_ref()),
         event_sink: Some(event_bus.as_ref()),
+        policy: None,
     };
     let outcome = run_agent(
         handle.provider.as_ref(),
@@ -223,6 +224,7 @@ async fn stream(
             session_id: Some(session_id),
             turn_sink: Some(runner.as_ref()),
             event_sink: Some(event_bus.as_ref()),
+            policy: None,
         };
         let mut on_event = |ev: &StreamEvent| {
             let sse = match ev {

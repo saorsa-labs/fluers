@@ -298,6 +298,7 @@ impl TaskTool {
             session_id: Some(child_session),
             turn_sink: None,
             event_sink: self.event_sink.as_deref(),
+            policy: None,
         };
 
         // Run the child to completion. Its events (SessionStarted → ... →

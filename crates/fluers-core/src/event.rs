@@ -151,6 +151,11 @@ pub struct RunHooks<'a> {
     pub turn_sink: Option<&'a dyn crate::TurnSink>,
     /// Optional event sink (typically `EventBus` for observability).
     pub event_sink: Option<&'a dyn EventSink>,
+    /// Optional **tool policy hook** (Fae deviation; see the README). When set,
+    /// the agent loop consults it before each tool call and denies/confirms
+    /// per the returned [`crate::policy::PolicyVerdict`]. `None` (the default)
+    /// means allow-all — existing consumers are unaffected.
+    pub policy: Option<&'a dyn crate::policy::ToolPolicy>,
 }
 
 impl<'a> RunHooks<'a> {
@@ -161,6 +166,7 @@ impl<'a> RunHooks<'a> {
             session_id: None,
             turn_sink: Some(turn_sink),
             event_sink: None,
+            policy: None,
         }
     }
 

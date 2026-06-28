@@ -593,6 +593,7 @@ pub(crate) async fn run(args: RunArgs) -> anyhow::Result<()> {
         session_id: Some(session_id),
         turn_sink: Some(&sink as &dyn fluers_core::TurnSink),
         event_sink: Some(event_sink),
+        policy: None,
     };
 
     let model = Model::new(&model_id);

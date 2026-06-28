@@ -83,6 +83,24 @@ so that each milestone produces a runnable, tested artifact.
 ➡️ **Read [`docs/PORTING_PLAN.md`](docs/PORTING_PLAN.md)** for the full
 milestone breakdown (MVP 0 → MVP 4).
 
+## Deviations from the upstream Flue port
+
+Because Saorsa Labs owns fluers, it may deviate from a faithful Flue port where
+a downstream consumer needs a generic seam. Deviations stay **generic** (no
+consumer-specific types leak into fluers) so the crate remains independently
+shippable.
+
+- **Tool policy hook** (`fluers_core::ToolPolicy` / `PolicyVerdict`, added
+  2026-06-28). A generic governance gate the agent loop consults *before* each
+  `Tool::execute`. Wired as an optional `policy` field on
+  `fluers_core::RunHooks` (chosen over `RunConfig` so the borrowed
+  `&dyn ToolPolicy` trait object does not force `RunConfig`'s `Debug`/`Clone`
+  derives). The default is `None` (allow-all), so existing consumers are
+  unaffected. A `PolicyVerdict::Deny(reason)` skips execution and appends a
+  model-visible error result (the loop continues, as with an unknown-tool
+  result); `Confirm(reason)` is treated as allow-with-log by callers without a
+  confirmation channel. Upstream Flue has no equivalent per-tool gate.
+
 ## Attribution
 
 Fluers is a native Rust reimplementation of the architecture of

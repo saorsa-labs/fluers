@@ -29,6 +29,7 @@ pub mod message;
 #[cfg(test)]
 mod message_tests;
 pub mod model;
+pub mod policy;
 pub mod request;
 pub mod runner;
 pub mod subagent;
@@ -39,6 +40,7 @@ pub use error::{CoreError, Result};
 pub use event::{EventSink, NullEventSink, RunEvent, RunHooks};
 pub use message::{AgentMessage, ContentBlock, ImageContent, Role, SignalMessage};
 pub use model::{Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent};
+pub use policy::{PolicyVerdict, ToolPolicy};
 pub use request::{ToolFactory, ToolRequestContext};
 pub use runner::{run_agent, run_agent_streaming, FanoutTurnSink, RunConfig, RunOutcome, TurnSink};
 pub use subagent::{

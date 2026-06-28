@@ -17,6 +17,7 @@ use crate::error::{CoreError, Result};
 use crate::event::{RunEvent, RunHooks};
 use crate::message::{AgentMessage, ContentBlock, Role};
 use crate::model::{Model, ModelProvider, ModelRequest, StreamEvent};
+use crate::policy::{PolicyVerdict, ToolPolicy};
 use crate::thinking::ThinkingLevel;
 use crate::tool::{InvokeContext, Tool, ToolCall, ToolResult};
 
@@ -328,8 +329,16 @@ pub async fn run_agent(
         }
 
         // Execute the turn's tool calls (sequential or bounded-parallel) and
-        // append a Tool message per call, in the original order.
-        let results = execute_tool_calls(tools, &tool_calls, cancel, config.tool_concurrency).await;
+        // append a Tool message per call, in the original order. The optional
+        // policy hook is consulted before each call (see `execute_tool_calls`).
+        let results = execute_tool_calls(
+            tools,
+            &tool_calls,
+            cancel,
+            config.tool_concurrency,
+            hooks.policy,
+        )
+        .await;
 
         // Emit ToolFinished and append tool-result messages.
         for (i, (id, call)) in tool_calls.iter().enumerate() {
@@ -524,8 +533,14 @@ pub async fn run_agent_streaming(
             });
         }
 
-        let results =
-            execute_tool_calls(tools, &owned_calls, cancel, config.tool_concurrency).await;
+        let results = execute_tool_calls(
+            tools,
+            &owned_calls,
+            cancel,
+            config.tool_concurrency,
+            hooks.policy,
+        )
+        .await;
 
         // Emit ToolFinished and append tool-result messages.
         for (i, (id, call)) in owned_calls.iter().enumerate() {
@@ -673,22 +688,74 @@ async fn invoke_with_budget(
     }
 }
 
+/// The result of consulting the [`ToolPolicy`] for one call.
+enum PolicyOutcome {
+    /// The call is cleared to execute.
+    Execute,
+    /// The call is denied; carry the model-visible error result to append in
+    /// place of executing the tool.
+    Denied(ToolResult),
+}
+
+/// Consult the optional policy hook for a single call.
+///
+/// `None` policy ⇒ allow-all. `Confirm` is treated as `Allow` with a logged
+/// note (a confirmation channel is out of scope for the loop itself). `Deny`
+/// yields a model-visible error result and the tool is not executed.
+async fn policy_check(
+    policy: Option<&dyn ToolPolicy>,
+    id: &str,
+    call: &ToolCall,
+    cancel: &CancellationToken,
+) -> PolicyOutcome {
+    let Some(policy) = policy else {
+        return PolicyOutcome::Execute;
+    };
+    let ctx = InvokeContext {
+        tool_call_id: id.to_string(),
+        cancel: cancel.clone(),
+    };
+    match policy.check(&call.name, &call.input, &ctx).await {
+        PolicyVerdict::Allow => PolicyOutcome::Execute,
+        PolicyVerdict::Confirm(reason) => {
+            tracing::info!(
+                tool = %call.name,
+                call_id = %id,
+                "tool policy returned Confirm; treating as Allow for this run: {reason}"
+            );
+            PolicyOutcome::Execute
+        }
+        PolicyVerdict::Deny(reason) => {
+            PolicyOutcome::Denied(error_result(&format!("denied by policy: {reason}")))
+        }
+    }
+}
+
 /// Execute all tool calls for a turn, returning results in the *original*
 /// order regardless of concurrency.
 ///
 /// - `tool_concurrency <= 1` ⇒ sequential (deterministic, the default).
 /// - `tool_concurrency > 1` ⇒ bounded-parallel on a `JoinSet`; each task is
 ///   handed its own child of the caller's `CancellationToken`.
+///
+/// When `policy` is set it is consulted **before** each call executes; a
+/// denied call is never dispatched and its slot carries a model-visible error
+/// result instead.
 async fn execute_tool_calls(
     tools: &[Arc<dyn Tool>],
     calls: &[(String, ToolCall)],
     cancel: &CancellationToken,
     tool_concurrency: usize,
+    policy: Option<&dyn ToolPolicy>,
 ) -> Vec<ToolResult> {
     if tool_concurrency <= 1 {
         let mut out = Vec::with_capacity(calls.len());
         for (id, call) in calls {
-            out.push(execute_tool_call(tools, id, call, cancel).await);
+            let result = match policy_check(policy, id, call, cancel).await {
+                PolicyOutcome::Execute => execute_tool_call(tools, id, call, cancel).await,
+                PolicyOutcome::Denied(result) => result,
+            };
+            out.push(result);
         }
         return out;
     }
@@ -702,6 +769,16 @@ async fn execute_tool_calls(
     let mut indexed: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
     let mut set: JoinSet<(usize, ToolResult)> = JoinSet::new();
     for (i, (id, call)) in calls.iter().enumerate() {
+        // Consult the policy hook before dispatching. A denied call fills its
+        // slot with an error result and is never spawned. (Awaited here, not
+        // inside the spawned task, so the borrowed `&dyn ToolPolicy` need not
+        // be `'static`.)
+        if let PolicyOutcome::Denied(result) = policy_check(policy, id, call, cancel).await {
+            if let Some(slot) = indexed.get_mut(i) {
+                *slot = Some(result);
+            }
+            continue;
+        }
         // Find the tool by name now (cheap) so the task owns an `Arc<dyn Tool>`.
         let tool = tools
             .iter()
@@ -1050,6 +1127,225 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "must abort on max_turns");
+    }
+
+    /// A policy that denies every tool call (generic; no Fae types).
+    struct DenyAllPolicy;
+
+    #[async_trait]
+    impl ToolPolicy for DenyAllPolicy {
+        async fn check(&self, _tool: &str, _input: &Value, _ctx: &InvokeContext) -> PolicyVerdict {
+            PolicyVerdict::Deny("blocked in test".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_deny_blocks_tool_but_run_continues() {
+        // Turn 1: model calls echo. The policy denies it: the tool must NOT
+        // execute, a denial error result is appended, and the loop continues
+        // to turn 2's final text — matching the unknown-tool recovery path.
+        let provider = MockProvider::new(vec![
+            vec![assistant_tool_use(
+                "c1",
+                "echo",
+                json!({ "text": "secret" }),
+            )],
+            vec![assistant_text("done")],
+        ]);
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call echo")];
+        let policy = DenyAllPolicy;
+        let hooks = RunHooks {
+            policy: Some(&policy),
+            ..RunHooks::default()
+        };
+
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &RunConfig::default(),
+            &CancellationToken::new(),
+            &hooks,
+        )
+        .await
+        .expect("loop completes despite denial");
+
+        assert_eq!(outcome.final_text, "done");
+        // The tool result must be the denial — proving the tool never ran.
+        let s = match &messages[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.to_string(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(s.contains("denied by policy"), "expected denial, got: {s}");
+        assert!(
+            !s.contains("echo: secret"),
+            "denied tool must NOT have executed: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_none_is_allow_all() {
+        // Default hooks (policy: None) must behave exactly as before: the tool
+        // executes and its echoed output reaches the model.
+        let provider = MockProvider::new(vec![
+            vec![assistant_tool_use("c1", "echo", json!({ "text": "hi" }))],
+            vec![assistant_text("done")],
+        ]);
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call echo")];
+
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &RunConfig::default(),
+            &CancellationToken::new(),
+            &RunHooks::default(),
+        )
+        .await
+        .expect("loop completes");
+        assert_eq!(outcome.final_text, "done");
+        let s = match &messages[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.to_string(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(s.contains("echo: hi"), "tool should have run: {s}");
+    }
+
+    /// A tool that records every execution into a shared log. Used to prove a
+    /// denied policy call never reaches `execute` — even under the parallel
+    /// (`tool_concurrency > 1`) path. (The sequential deny test above inspects
+    /// the result text; this one inspects whether `execute` ran at all.)
+    struct RecordingTool {
+        name: String,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn definition(&self) -> crate::tool::ToolDefinition {
+            crate::tool::ToolDefinition {
+                name: self.name.clone(),
+                label: "Recording".into(),
+                description: "Records each execution.".into(),
+                parameters: crate::tool::ParameterSchema::default(),
+            }
+        }
+
+        async fn execute(&self, _ctx: InvokeContext, input: Value) -> Result<ToolResult> {
+            let tag = input
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            self.log.lock().expect("lock poisoned").push(tag);
+            Ok(ToolResult {
+                content: vec![json!({ "type": "text", "text": "ran" })],
+                details: None,
+            })
+        }
+    }
+
+    /// Regression guard for the security-critical parallel-path invariant: the
+    /// policy hook MUST be consulted under `tool_concurrency > 1`, every denied
+    /// call MUST be skipped (its tool never executes), and each denied slot
+    /// MUST carry a model-visible denial result so the loop continues.
+    ///
+    /// (The "checked before `JoinSet::spawn`" placement is enforced by the
+    /// borrow checker — the borrowed `&dyn ToolPolicy` is not `'static` and so
+    /// cannot move into a spawned task; `policy_check` is awaited outside the
+    /// task. This test pins the *behavior* that placement guarantees.)
+    #[tokio::test]
+    async fn policy_deny_blocks_tools_on_the_parallel_path() {
+        // One turn, 3 tool calls, concurrency = 4 (well into the parallel path).
+        // DenyAllPolicy refuses every call: none of the 3 tools may execute.
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RecordingTool {
+            name: "rec".into(),
+            log: log.clone(),
+        })];
+        let turn = vec![
+            assistant_tool_use("c1", "rec", json!({ "tag": "one" })),
+            assistant_tool_use("c2", "rec", json!({ "tag": "two" })),
+            assistant_tool_use("c3", "rec", json!({ "tag": "three" })),
+        ];
+        let provider = MockProvider::new(vec![turn, vec![assistant_text("done")]]);
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("call all three")];
+        let config = RunConfig {
+            tool_concurrency: 4,
+            ..RunConfig::default()
+        };
+        let policy = DenyAllPolicy;
+        let hooks = RunHooks {
+            policy: Some(&policy),
+            ..RunHooks::default()
+        };
+
+        let outcome = run_agent(
+            &provider,
+            &tools,
+            &mut messages,
+            &model,
+            &config,
+            &CancellationToken::new(),
+            &hooks,
+        )
+        .await
+        .expect("loop completes despite denials");
+
+        assert_eq!(outcome.final_text, "done");
+
+        // Negative control: NO tool executed. If the parallel path skipped the
+        // policy check (or checked inside the task after dispatch), the log
+        // would be non-empty.
+        let executed = log.lock().expect("lock poisoned").clone();
+        assert!(
+            executed.is_empty(),
+            "denied tools must NOT execute on the parallel path: ran {executed:?}"
+        );
+
+        // Every denied slot carries a model-visible denial result, in issued
+        // order, so the model can recover.
+        let results: Vec<String> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| match &m.content[0] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    let text = content.to_string();
+                    Some(format!("{tool_use_id}:{text}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results.len(),
+            3,
+            "all 3 denied calls must produce a result slot: {results:?}"
+        );
+        for r in &results {
+            assert!(
+                r.contains("denied by policy"),
+                "parallel-path denial must surface to the model: {r}"
+            );
+        }
+        // Slots remain in issued order (c1, c2, c3) — the denial must not
+        // reshuffle results under concurrency.
+        assert!(
+            results[0].starts_with("c1:")
+                && results[1].starts_with("c2:")
+                && results[2].starts_with("c3:"),
+            "denial slots must preserve issued order: {results:?}"
+        );
     }
 
     #[tokio::test]
@@ -1595,6 +1891,7 @@ mod tests {
             event_sink: Some(&RecordingSink {
                 events: sink.clone(),
             } as &dyn EventSink),
+            policy: None,
         };
 
         run_agent(
@@ -1653,6 +1950,7 @@ mod tests {
             event_sink: Some(&RecordingSink {
                 events: sink.clone(),
             } as &dyn EventSink),
+            policy: None,
         };
 
         run_agent(
@@ -1696,6 +1994,7 @@ mod tests {
             event_sink: Some(&RecordingSink {
                 events: sink.clone(),
             } as &dyn EventSink),
+            policy: None,
         };
 
         run_agent(
