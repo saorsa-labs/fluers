@@ -9,19 +9,33 @@
 //! UID separation). It prevents accidental path escape; it is not a defense
 //! against a determined adversary until OS isolation lands.
 
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
+use rustix::fs::{fstat, open, openat, Mode, OFlags};
+use rustix::io::Errno;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{Limits, SessionEnv, ShellResult};
 use crate::error::{RuntimeError, RuntimeResult};
 
+/// POSIX `st_mode` masks (stable, platform-independent) for the regular-file
+/// check — avoids pulling `libc` just for `S_ISREG`.
+const ST_MODE_TYPE_MASK: u32 = 0o170_000; // S_IFMT
+const ST_MODE_REGULAR: u32 = 0o100_000; // S_IFREG
+
 /// A `SessionEnv` backed by a real local directory.
 pub struct LocalSessionEnv {
     /// Canonicalized root all relative paths are joined under.
     root: PathBuf,
+    /// Held fd over the canonical root (B-Swift Phase C1a / #4): the anchor for
+    /// `openat`-walked reads. Opened once at construction with
+    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, so root-path re-resolution never
+    /// re-enters the read hot path. `OwnedFd` is `Send + Sync` on Unix.
+    root_fd: OwnedFd,
     #[allow(dead_code)]
     limits: Limits,
 }
@@ -37,8 +51,17 @@ impl LocalSessionEnv {
         let canon = tokio::fs::canonicalize(&root)
             .await
             .map_err(RuntimeError::Io)?;
+        // Hold an fd over the canonical root (B-Swift Phase C1a / #4). Opened
+        // with O_NOFOLLOW (reject a root swapped to a symlink since construction)
+        // + O_DIRECTORY + O_CLOEXEC.
+        let root_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let root_fd = match open(&canon, root_flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) => return Err(RuntimeError::Io(std::io::Error::from(e))),
+        };
         Ok(Self {
             root: canon,
+            root_fd,
             limits,
         })
     }
@@ -85,6 +108,85 @@ impl LocalSessionEnv {
             Err(_) => Ok(joined),
         }
     }
+
+    /// Open `rel` for reading via an fd-anchored walk from the held root fd
+    /// (B-Swift Phase C1a / #4). Closes the path-based TOCTOU at the daemon
+    /// read: every component is opened with `O_NOFOLLOW` (symlink → `ELOOP`),
+    /// and the leaf is `fstat`'d on the SAME fd we hand back for reading — so a
+    /// symlink/hardlink swap between confinement and the read cannot exfiltrate.
+    /// Mirrors the Swift `readFdAnchored`.
+    ///
+    /// Returns the opened regular-file `File` and its size in bytes (the size is
+    /// authoritative — taken off the open fd, not the path).
+    fn open_anchored_read(&self, rel: &Path) -> RuntimeResult<(std::fs::File, u64)> {
+        // Input shape checks (the fd walk itself enforces containment — there is
+        // no canonicalize-then-contain step, so no path re-resolution).
+        if rel.is_absolute() {
+            return Err(RuntimeError::Sandbox(format!(
+                "absolute paths are not allowed: `{}`",
+                rel.display()
+            )));
+        }
+        if rel.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(RuntimeError::Sandbox(format!(
+                "`..` is not allowed in paths: `{}`",
+                rel.display()
+            )));
+        }
+
+        let oflag = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        // Walk: hold every opened fd in `chain` so intermediates stay alive
+        // until the next level is opened; the last element is the leaf.
+        let mut chain: Vec<OwnedFd> = Vec::new();
+        for comp in rel.components() {
+            if let Component::Normal(name) = comp {
+                let dir = match chain.last() {
+                    Some(f) => f.as_fd(),
+                    None => self.root_fd.as_fd(),
+                };
+                let fd = match openat(dir, name, oflag, Mode::empty()) {
+                    Ok(fd) => fd,
+                    Err(Errno::LOOP) => {
+                        return Err(RuntimeError::Sandbox(format!(
+                            "symlinks are not allowed in read paths: `{}`",
+                            rel.display()
+                        )));
+                    }
+                    Err(e) => return Err(RuntimeError::Io(std::io::Error::from(e))),
+                };
+                chain.push(fd);
+            }
+            // `Component::CurDir` (".") is skipped; `ParentDir`/absolute are
+            // pre-rejected above.
+        }
+        let leaf_owned = chain
+            .pop()
+            .ok_or_else(|| RuntimeError::Sandbox("read path has no components".to_string()))?;
+        // Remaining `chain` (intermediates) drops here → their fds close.
+
+        // Authoritative leaf check: fstat the OPENED fd (not the path).
+        let stat = match fstat(leaf_owned.as_fd()) {
+            Ok(s) => s,
+            Err(e) => return Err(RuntimeError::Io(std::io::Error::from(e))),
+        };
+        if (stat.st_mode as u32 & ST_MODE_TYPE_MASK) != ST_MODE_REGULAR {
+            return Err(RuntimeError::Sandbox(format!(
+                "not a regular file: `{}`",
+                rel.display()
+            )));
+        }
+        if stat.st_nlink > 1 {
+            // Hardlink exfil (`ln secret in_root; read in_root/link`) — mirrors
+            // the Swift-side C2/#3 reject. Authoritative here: fstat off the
+            // open fd, not the path.
+            return Err(RuntimeError::Sandbox(format!(
+                "multiple hard links — can't safely confine: `{}`",
+                rel.display()
+            )));
+        }
+        let size = stat.st_size.max(0) as u64;
+        Ok((std::fs::File::from(leaf_owned), size))
+    }
 }
 
 #[async_trait]
@@ -95,19 +197,23 @@ impl SessionEnv for LocalSessionEnv {
         max_lines: usize,
         max_bytes: usize,
     ) -> RuntimeResult<String> {
-        let resolved = self.resolve(path)?;
-        let raw = tokio::fs::read_to_string(&resolved)
+        // B-Swift Phase C1a / #4: fd-anchored open + read from the SAME fd
+        // (closes the check-then-use TOCTOU the path-based read had).
+        let (file, _size) = self.open_anchored_read(path)?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)
             .await
             .map_err(RuntimeError::Io)?;
         Ok(apply_read_limits(raw, max_lines, max_bytes))
     }
 
     async fn read_file_full(&self, path: &Path, max_bytes: usize) -> RuntimeResult<String> {
-        let resolved = self.resolve(path)?;
-        let meta = tokio::fs::metadata(&resolved)
-            .await
-            .map_err(RuntimeError::Io)?;
-        let size = meta.len() as usize;
+        // B-Swift Phase C1a / #4: size + read off the SAME open fd. The old
+        // path-based metadata check raced the read; now the size gate is
+        // authoritative (fstat off the open fd) and the read uses that fd.
+        let (file, size) = self.open_anchored_read(path)?;
+        let size = size as usize;
         if size > max_bytes {
             return Err(RuntimeError::FileTooLarge {
                 path: path.display().to_string(),
@@ -115,9 +221,12 @@ impl SessionEnv for LocalSessionEnv {
                 max: max_bytes,
             });
         }
-        tokio::fs::read_to_string(&resolved)
+        let mut file = tokio::fs::File::from_std(file);
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)
             .await
-            .map_err(RuntimeError::Io)
+            .map_err(RuntimeError::Io)?;
+        Ok(raw)
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> RuntimeResult<()> {
@@ -579,5 +688,165 @@ mod tests {
             .unwrap();
         let res = env.grep("foo", &["../.env"], 10).await;
         assert!(res.is_err(), "`..` grep paths must be rejected");
+    }
+
+    // ── B-Swift Phase C1a / #4: fd-anchored read TOCTOU / hardlink coverage ──
+    // These prove the fix: the OLD path-based `read_to_string(resolved)` followed
+    // symlinks (leaking the target) and ignored `st_nlink`, so each of these
+    // would have SUCCEEDED (exfiltrated the secret) before the fix.
+
+    /// Write a secret to a file OUTSIDE the env root (a sibling temp dir) and
+    /// return both the held `TempDir` (keep alive for the test) and its path.
+    #[cfg(unix)]
+    fn outside_secret(body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_symlink_leaf_even_when_target_inside_root() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("inside.txt"), "ok\n")
+            .await
+            .unwrap();
+        symlink("inside.txt", dir.path().join("link.txt")).unwrap();
+        let res = env.read_file(Path::new("link.txt"), 100, 1024).await;
+        assert!(
+            res.is_err(),
+            "a symlink leaf must be rejected even if its target is inside the root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_symlink_leaf_to_outside_root() {
+        // Exfil via symlink: link.txt -> /outside/secret. The OLD read followed
+        // it and leaked "TOPSECRET"; the anchored `openat(O_NOFOLLOW)` rejects
+        // the symlink leaf outright.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let (_outside, secret) = outside_secret("TOPSECRET");
+        symlink(&secret, dir.path().join("link.txt")).unwrap();
+        let res = env.read_file(Path::new("link.txt"), 100, 1024).await;
+        assert!(
+            res.is_err(),
+            "a symlink to outside the root must be rejected"
+        );
+        if let Ok(s) = res {
+            assert!(!s.contains("TOPSECRET"), "the secret must not leak");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_intermediate_symlink_dir() {
+        // Exfil via a symlinked intermediate dir: linkdir -> realdir; reading
+        // `linkdir/file.txt` must reject at the `linkdir` component (per-component
+        // `openat(O_NOFOLLOW)`).
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("realdir"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("realdir/file.txt"), "ok\n")
+            .await
+            .unwrap();
+        symlink("realdir", dir.path().join("linkdir")).unwrap();
+        let res = env
+            .read_file(Path::new("linkdir/file.txt"), 100, 1024)
+            .await;
+        assert!(
+            res.is_err(),
+            "a symlinked intermediate dir must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_hardlink_to_outside_secret() {
+        // Hardlink exfil: `ln /outside/secret root/link.txt`. The file is regular
+        // and inside the root, but `st_nlink > 1` → reject (mirrors the Swift
+        // C2/#3 decision; authoritative here via post-open `fstat`).
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let (_outside, secret) = outside_secret("TOPSECRET");
+        std::fs::hard_link(&secret, dir.path().join("link.txt")).unwrap();
+        let res = env.read_file(Path::new("link.txt"), 100, 1024).await;
+        assert!(res.is_err(), "a hardlink (st_nlink > 1) must be rejected");
+        if let Ok(s) = res {
+            assert!(!s.contains("TOPSECRET"), "the secret must not leak");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_full_rejects_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let (_outside, secret) = outside_secret("TOPSECRET");
+        symlink(&secret, dir.path().join("link.txt")).unwrap();
+        let res = env.read_file_full(Path::new("link.txt"), 1024).await;
+        assert!(res.is_err(), "read_file_full must reject a symlink leaf");
+        if let Ok(s) = res {
+            assert!(!s.contains("TOPSECRET"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_full_rejects_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let (_outside, secret) = outside_secret("TOPSECRET");
+        std::fs::hard_link(&secret, dir.path().join("link.txt")).unwrap();
+        let res = env.read_file_full(Path::new("link.txt"), 1024).await;
+        assert!(
+            res.is_err(),
+            "read_file_full must reject a hardlink (st_nlink > 1)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_anchored_nested_relative_path_still_works() {
+        // Regression guard: the anchored walk must still read a real nested
+        // file (intermediate dirs are opened `O_NOFOLLOW` + read off the leaf fd).
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("a/b"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("a/b/c.txt"), "deep\n")
+            .await
+            .unwrap();
+        let got = env
+            .read_file(Path::new("a/b/c.txt"), 100, 1024)
+            .await
+            .unwrap();
+        assert_eq!(got, "deep\n");
     }
 }

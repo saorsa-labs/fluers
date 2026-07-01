@@ -650,6 +650,7 @@ dependencies = [
  "chrono",
  "fluers-core",
  "parking_lot",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

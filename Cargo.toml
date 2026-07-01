@@ -85,6 +85,11 @@ rmcp = { version = "1.8", default-features = false, features = ["client", "trans
 
 # Sandbox / process
 nix = { version = "0.29", features = ["signal", "process"] }
+# Safe fd-anchored filesystem ops for `fluers-runtime` reads (`openat`, `fstat`,
+# `OFlags`) — returns `OwnedFd`/`Stat` directly, so no `unsafe` (the crate is
+# `#![forbid(unsafe_code)]`, which rules out `nix`'s `RawFd`-returning API).
+# Already a transitive dep via tokio, so this adds no build weight.
+rustix = { version = "1.0", features = ["fs"] }
 
 # Postgres persistence (fluers-postgres)
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }

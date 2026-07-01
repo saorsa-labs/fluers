@@ -23,6 +23,11 @@ uuid.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 tokio-util.workspace = true
+# B-Swift Phase C1a / #4: fd-anchored reads (`openat` + `O_NOFOLLOW` + `fstat`).
+# Chosen over `nix` because this crate is `#![forbid(unsafe_code)]` and rustix's
+# `openat`/`fstat` return `OwnedFd`/`Stat` directly (no `RawFd` → no `unsafe`).
+# Already a transitive dep via tokio, so this adds no build weight.
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
