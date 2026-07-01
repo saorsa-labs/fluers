@@ -250,6 +250,14 @@ pub(crate) struct DeployArgs {
     /// Target platform. Only `docker` is supported (MVP).
     #[arg(long, default_value = "docker")]
     pub target: String,
+    /// Host port to publish (maps to the container's 3000). `docker run -p`.
+    #[arg(long, default_value_t = 3000)]
+    pub port: u16,
+    /// Bearer token the containerized server requires. Required for a
+    /// network-exposed container (the server refuses a `0.0.0.0` bind without
+    /// one). Falls back to `FLUERS_SERVER_TOKEN`.
+    #[arg(long, env = "FLUERS_SERVER_TOKEN")]
+    pub auth_token: Option<String>,
     /// Trailing args passed to `fluers` inside the container
     /// (everything after `--`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -759,10 +767,14 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         memory_api_key: None,
         memory_user_id: None,
         memory_limit: 5,
-        otel_endpoint: None,
+        otel_endpoint: args.otel_endpoint.clone(),
         agent: None,
         list_sessions: false,
     })?;
+    // NOTE: full OTel tracing init in the dev server path (a server-wide
+    // EventBus wired into every agent run) is a follow-up; the flag/env value
+    // is threaded here so it is no longer silently dropped, and so a future
+    // dev-side init consumes it without a second change here.
     let provider: Arc<dyn fluers_core::ModelProvider> = Arc::new(provider);
     let model = Model::new(&model_id);
 
@@ -944,8 +956,44 @@ pub(crate) async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     }
     ensure_docker()?;
     eprintln!("→ deploying via Docker…");
+    // The container binds 0.0.0.0:3000 so it's reachable via the published port.
+    // A non-loopback bind REQUIRES an auth token — pass it through to the
+    // containerized server (`serve_with_options` enforces this).
+    let auth_token = args.auth_token.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "deploy requires --auth-token / FLUERS_SERVER_TOKEN (the container \
+             binds 0.0.0.0 and the server refuses that without auth)"
+        )
+    })?;
     let mut cmd = std::process::Command::new("docker");
-    cmd.args(["run", "--rm", "-i", "fluers:latest"]);
+    cmd.args([
+        "run",
+        "--rm",
+        "-i",
+        "-p",
+        &format!("{}:3000", args.port),
+        "-e",
+        &format!("FLUERS_SERVER_TOKEN={auth_token}"),
+    ]);
+    // Pass through common provider key env vars if the caller set them, so the
+    // containerized agent can reach the model provider.
+    for var in [
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "FLUERS_API_KEY",
+        "FLUERS_PROVIDER",
+        "FLUERS_MODEL",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                cmd.args(["-e", &format!("{var}={val}")]);
+            }
+        }
+    }
+    cmd.arg("fluers:latest");
+    // Inside the container: serve on all interfaces with the token.
+    cmd.args(["dev", "--host", "0.0.0.0"]);
     // Pass through any trailing args to fluers inside the container.
     cmd.args(&args.passthrough);
     let status = cmd

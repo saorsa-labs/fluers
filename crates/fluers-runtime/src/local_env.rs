@@ -476,10 +476,19 @@ impl SessionEnv for LocalSessionEnv {
         // `kill_on_drop(true)`: on timeout/cancel the in-flight `wait_with_output`
         // future (which owns the child) is dropped, and its `Drop` sends SIGKILL —
         // so a still-running child is never orphaned.
+        //
+        // `env_clear()` + allowlist: model-run shells must NOT inherit the
+        // parent's full environment — that includes provider API keys
+        // (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `FLUERS_SERVER_TOKEN`, …),
+        // which a prompt-injected model could exfiltrate via `env | grep KEY`.
+        // Only a safe, minimal allowlist (needed for commands to function) is
+        // re-set.
         let child = Command::new("sh")
             .arg("-c")
             .arg(command)
             .current_dir(&cwd_path)
+            .env_clear()
+            .envs(safe_exec_env())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -835,6 +844,30 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The minimal, safe environment re-applied to a model-run shell after
+/// [`std::process::Command::env_clear`]. Carries only what commands need to
+/// function — NOT provider API keys, tokens, or other secrets the parent holds.
+/// Locale/timezone are passed through (set by the user's login shell) so command
+/// output formatting matches the user's session. Keys are owned to avoid
+/// per-call leaking.
+fn safe_exec_env() -> Vec<(String, std::ffi::OsString)> {
+    let mut out: Vec<(String, std::ffi::OsString)> = Vec::new();
+    // Essentials for commands to run and find binaries.
+    for name in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR"] {
+        if let Some(v) = std::env::var_os(name) {
+            out.push((name.to_string(), v));
+        }
+    }
+    // Locale/timezone (formatting only — no secrets).
+    for (k, v) in std::env::vars_os() {
+        let key = k.to_string_lossy().into_owned();
+        if key == "TZ" || key.starts_with("LANG") || key.starts_with("LC_") {
+            out.push((key, v));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     //! Local sandbox path-containment and tool tests against a temp dir.
@@ -1028,6 +1061,32 @@ mod tests {
             .unwrap();
         assert_eq!(res.exit_code, 0);
         assert_eq!(res.stdout.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn exec_does_not_leak_parent_env_secrets() {
+        // The model-run shell must NOT inherit provider keys / tokens from the
+        // parent. We set a distinctive secret in the parent env, run `env` in the
+        // child, and assert the secret is absent (env_clear + allowlist).
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        std::env::set_var("FLUERS_TEST_SECRET", "leak-me-if-you-can");
+        let res = env
+            .exec("env", Path::new("."), None, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(res.exit_code, 0, "env should run");
+        assert!(
+            !res.stdout.contains("FLUERS_TEST_SECRET"),
+            "parent env secret must not leak into the model-run shell"
+        );
+        assert!(
+            !res.stdout.contains("leak-me-if-you-can"),
+            "the secret value must not appear in the child env"
+        );
+        std::env::remove_var("FLUERS_TEST_SECRET");
     }
 
     #[tokio::test]

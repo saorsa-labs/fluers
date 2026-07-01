@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Model providers for Fluers (OpenAI-compatible: OpenRouter, MiniMax, local)"
+publish = false
 
 [lints]
 workspace = true

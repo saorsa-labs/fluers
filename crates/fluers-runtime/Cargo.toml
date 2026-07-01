@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "The Fluers agent harness: agent definition, sessions, skills, sandbox, events"
+keywords = ["agent", "llm", "ai", "harness", "sandbox"]
+categories = ["science", "api-bindings"]
 
 [lints]
 workspace = true

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "The `fluers` CLI: build/dev/deploy tooling for Fluers agents"
+publish = false
 
 [[bin]]
 name = "fluers"

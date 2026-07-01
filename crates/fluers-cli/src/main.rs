@@ -1,8 +1,9 @@
 //! `fluers` — the command-line entry point.
 //!
-//! Mirrors Flue's `flue` binary (`packages/cli/bin/flue.ts`). MVP provides a
-//! `version`, a `run` command that boots a local agent, and stubs for
-//! `dev`/`build`/`deploy`.
+//! Mirrors Flue's `flue` binary (`packages/cli/bin/flue.ts`). Provides a
+//! `version`, a `run` command that runs a local agent, and `dev`/`build`/
+//! `deploy` for the local dev server, release binary (+ optional Docker image),
+//! and Docker deployment respectively.
 
 #![forbid(unsafe_code)]
 
@@ -24,9 +25,9 @@ struct Cli {
 enum Command {
     /// Show version and crate layout info.
     Version,
-    /// Run an agent locally (MVP: prints the resolved profile).
+    /// Run an agent locally.
     Run(Box<commands::RunArgs>),
-    /// Start the dev server (stub).
+    /// Start the dev server.
     Dev(Box<commands::DevArgs>),
     /// Build the fluers binary (and optionally a Docker image).
     Build(commands::BuildArgs),

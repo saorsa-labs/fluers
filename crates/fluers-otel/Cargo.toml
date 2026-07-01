@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "OpenTelemetry tracing adapter for Fluers"
+publish = false
 
 [lints]
 workspace = true

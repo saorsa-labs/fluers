@@ -116,9 +116,21 @@ fn router_with_options(state: Arc<ServerState>) -> Router {
 /// Bind the base router to `addr` and serve until shutdown (local-dev
 /// convenience entry: no auth, no graceful-shutdown cleanup).
 ///
+/// Bind the base router to `addr` and serve until shutdown (local-dev
+/// convenience entry: no auth, no graceful-shutdown cleanup). Reads options
+/// from [`ServerState::options`]. Like [`serve_with_options`], a non-loopback
+/// bind without an auth token is refused.
+///
 /// # Errors
 /// Returns an error if the address cannot be bound.
 pub async fn serve(addr: SocketAddr, state: Arc<ServerState>) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() && state.options.auth_token.is_none() {
+        return Err(anyhow::anyhow!(
+            "refusing to bind non-loopback {addr} without an auth token — the \
+             registered agents can run shell commands; pass --auth-token / \
+             FLUERS_SERVER_TOKEN, or bind 127.0.0.1"
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;

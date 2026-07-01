@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Core agent primitives and model abstractions for Fluers (port of pi-agent-core + pi-ai)"
+keywords = ["agent", "llm", "ai", "harness"]
+categories = ["science", "api-bindings"]
 
 [lints]
 workspace = true

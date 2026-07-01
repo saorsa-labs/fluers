@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "axum HTTP server exposing Fluers agents (dispatch / invoke / stream / runs)"
+publish = false
 
 [lints]
 workspace = true
