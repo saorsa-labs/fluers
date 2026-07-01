@@ -1,0 +1,160 @@
+# Release — publish fluers crates to crates.io
+#
+# Triggered by version tags (v*) or manual workflow_dispatch. Publishes the
+# publishable workspace crates in dependency order (fluers-core first, then
+# fluers-runtime which depends on it via { path, version }), mirroring the
+# saorsa-labs release pattern (saorsa-gossip/saorsa-cli/saorsa-node).
+#
+# Requires the `CRATES_IO_TOKEN` repository secret (a crates.io API token with
+# publish-update scope for the `fluers-core` and `fluers-runtime` crates).
+#
+# Safety: dry_run defaults to true, and publish only runs on tag refs — so a
+# manual workflow_dispatch from main validates but never publishes.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (validate only — no actual publish)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Do NOT cancel an in-flight release — a half-published set is the worst case.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag ↔ Cargo.toml version match
+        # Only meaningful for tag pushes; skip on plain workflow_dispatch.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag '${GITHUB_REF_NAME}' does not match workspace version 'v${VERSION}'"
+            exit 1
+          fi
+          echo "tag '${GITHUB_REF_NAME}' matches workspace version '${VERSION}'"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  publish:
+    name: Publish to crates.io
+    needs: validate
+    runs-on: ubuntu-latest
+    # Publish ONLY on tag refs (never a manual run from main, which defaults
+    # to dry_run=true anyway). dry_run runs the validate job only.
+    if: startsWith(github.ref, 'refs/tags/') && github.event.inputs.dry_run != 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fail fast if CRATES_IO_TOKEN secret is missing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CRATES_IO_TOKEN repository secret is not set"
+            echo "Add it via: gh secret set CRATES_IO_TOKEN --repo saorsa-labs/fluers"
+            exit 1
+          fi
+          echo "CRATES_IO_TOKEN present"
+
+      - name: Publish crates (in dependency order, with retry)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -u
+          # publish_crate <name> <max_tries>
+          #  - "already exists/uploaded/previously uploaded" → success (idempotent)
+          #  - "no matching package named" → index lag → retry after sleep
+          #  - anything else → hard failure
+          publish_crate() {
+            local name="$1" max_tries="${2:-1}" try=1
+            while :; do
+              echo "::group::Try ${try}/${max_tries}: cargo publish -p ${name}"
+              OUTPUT=$(cargo publish -p "${name}" --no-verify 2>&1) && {
+                echo "✓ published ${name}"
+                echo "::endgroup::"
+                return 0
+              }
+              echo "::endgroup::"
+              if echo "$OUTPUT" | grep -Eq 'already exists|already uploaded|previously uploaded'; then
+                echo "→ ${name} already published — treating as success"
+                return 0
+              fi
+              if echo "$OUTPUT" | grep -q 'no matching package named'; then
+                if [ "$try" -lt "$max_tries" ]; then
+                  echo "→ index lag for a dependency of ${name}; sleeping 30s and retrying…"
+                  sleep 30
+                  try=$((try + 1))
+                  continue
+                fi
+              fi
+              echo "$OUTPUT"
+              echo "::error::Failed to publish ${name}"
+              return 1
+            done
+          }
+
+          # fluers-core has no internal deps: one try (idempotency only).
+          publish_crate fluers-core 1
+
+          # fluers-runtime depends on fluers-core via { path, version }, which
+          # becomes a registry requirement on publish. The freshly-indexed
+          # fluers-core may not be visible to crates.io immediately, so allow
+          # several retries with 30s spacing.
+          publish_crate fluers-runtime 10
+
+          echo "All publishable crates published successfully!"
+
+  release:
+    name: GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
