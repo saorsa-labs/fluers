@@ -598,7 +598,12 @@ impl SessionEnv for LocalSessionEnv {
         let search = validated.join(" ");
         // The process cwd is the root's inode path too (belt-and-suspenders);
         // `rg --no-follow` / the `find -P` fallback never follow symlinks.
-        let rg = Command::new("sh")
+        // `kill_on_drop(true)` + a bounded timeout ensure a grep against a hung
+        // filesystem (stuck NFS, adversarial tree) can neither block this future
+        // forever nor orphan the child. The trait gives no cancel token/timeout,
+        // so a fixed ceiling is applied here.
+        const GREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let child = Command::new("sh")
             .arg("-c")
             .arg(format!(
                 "rg -n --no-follow -- {pat} {search} 2>/dev/null \
@@ -606,9 +611,17 @@ impl SessionEnv for LocalSessionEnv {
                 pat = shell_quote(pattern),
             ))
             .current_dir(&root_path)
-            .output()
-            .await
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
             .map_err(RuntimeError::Io)?;
+        let rg = match tokio::time::timeout(GREP_TIMEOUT, child.wait_with_output()).await {
+            Ok(res) => res.map_err(RuntimeError::Io)?,
+            // On timeout the `wait_with_output` future is dropped; `kill_on_drop`
+            // SIGKILLs the child. Surface an empty result rather than hanging.
+            Err(_) => return Ok(Vec::new()),
+        };
         let out = String::from_utf8_lossy(&rg.stdout);
         // Search paths are absolute inode paths (see above), so `rg`/`grep` emit
         // absolute paths — strip the root's inode prefix so results stay
@@ -858,10 +871,12 @@ fn safe_exec_env() -> Vec<(String, std::ffi::OsString)> {
             out.push((name.to_string(), v));
         }
     }
-    // Locale/timezone (formatting only — no secrets).
+    // Locale/timezone (formatting only — no secrets). Use exact names plus the
+    // `LC_` category prefix; a broad `LANG` prefix match would also pass secrets
+    // like `LANGCHAIN_API_KEY`/`LANGFUSE_SECRET_KEY`, defeating `env_clear()`.
     for (k, v) in std::env::vars_os() {
         let key = k.to_string_lossy().into_owned();
-        if key == "TZ" || key.starts_with("LANG") || key.starts_with("LC_") {
+        if matches!(key.as_str(), "TZ" | "LANG" | "LANGUAGE") || key.starts_with("LC_") {
             out.push((key, v));
         }
     }
@@ -1087,6 +1102,31 @@ mod tests {
             "the secret value must not appear in the child env"
         );
         std::env::remove_var("FLUERS_TEST_SECRET");
+    }
+
+    #[tokio::test]
+    async fn exec_does_not_leak_lang_prefixed_secrets() {
+        // Regression: the locale allowlist once used `starts_with("LANG")`, which
+        // also passed secrets like `LANGCHAIN_API_KEY` into the child. The
+        // allowlist must match locale names exactly, not by `LANG` prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        std::env::set_var("LANGCHAIN_API_KEY", "lang-prefixed-secret");
+        let res = env
+            .exec("env", Path::new("."), None, &CancellationToken::new())
+            .await
+            .unwrap();
+        std::env::remove_var("LANGCHAIN_API_KEY");
+        assert!(
+            !res.stdout.contains("LANGCHAIN_API_KEY"),
+            "a LANG-prefixed secret must not leak into the model-run shell"
+        );
+        assert!(
+            !res.stdout.contains("lang-prefixed-secret"),
+            "the LANG-prefixed secret value must not appear in the child env"
+        );
     }
 
     #[tokio::test]

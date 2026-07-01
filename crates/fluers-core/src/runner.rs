@@ -401,20 +401,26 @@ async fn collect_streamed_turn(
     use futures::StreamExt;
     let mut turn = StreamedTurn::default();
     let mut s = stream;
+    // A single deadline for the whole turn (not reset per item). Mirrors
+    // `invoke_with_budget`, which wraps the entire provider call in one
+    // timeout: a provider trickling one byte just under the timeout must not
+    // be able to extend the turn indefinitely by resetting a per-item clock.
+    let deadline = turn_timeout_ms
+        .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
     loop {
         // Fast-path cancellation check (mirrors `invoke_with_budget`).
         if cancel.is_cancelled() {
             return Err(CoreError::Cancelled("turn cancelled during stream".into()));
         }
-        // Compose the per-item await with the turn timeout and the run's
+        // Compose the per-item await with the turn-wide deadline and the run's
         // cancellation token. A provider that stalls mid-SSE would otherwise
         // hang the session forever (the non-streaming path has this via
         // `invoke_with_budget`; streaming must too — it's the server's primary
         // mode).
         let next = async { s.next().await };
-        let item = match turn_timeout_ms {
-            Some(ms) => {
-                let to = tokio::time::timeout(std::time::Duration::from_millis(ms), next);
+        let item = match deadline {
+            Some(deadline) => {
+                let to = tokio::time::timeout_at(deadline, next);
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -426,6 +432,7 @@ async fn collect_streamed_turn(
                         Ok(Some(item)) => item,
                         Ok(None) => break, // stream ended cleanly
                         Err(_) => {
+                            let ms = turn_timeout_ms.unwrap_or(0);
                             return Err(CoreError::Cancelled(format!(
                                 "turn timed out after {ms}ms"
                             )));

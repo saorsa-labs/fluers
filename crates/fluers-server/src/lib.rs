@@ -205,7 +205,7 @@ async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if provided == expected {
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         Ok(next.run(req).await)
     } else {
         Err((
@@ -213,6 +213,20 @@ async fn bearer_auth(
             "missing or invalid bearer token".to_string(),
         ))
     }
+}
+
+/// Constant-time byte-slice equality, to keep bearer-token verification free of
+/// a timing side channel that would let an attacker recover the token
+/// byte-by-byte. Length mismatch short-circuits (token length is not secret).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Wait for a shutdown signal (SIGTERM on Unix, Ctrl-C everywhere).
@@ -296,6 +310,13 @@ async fn invoke(
 
     let model = fluers_core::Model::new(&model_id);
     let cancel = CancellationToken::new();
+    // Track this run so graceful shutdown can cancel it (and flip its status to
+    // Failed). The guard untracks on any exit path, including early `?` returns.
+    state.track_run(run_id, cancel.clone());
+    let _run_guard = RunGuard {
+        run_id,
+        state: state.clone(),
+    };
     let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
     // Build the request's tools: static list (legacy) or a fresh factory-built
     // list with a request-local `task` tool (config-UX). Either way, the tools
@@ -771,6 +792,15 @@ mod tests {
             msg.contains("auth token") || msg.contains("auth-token"),
             "error should explain the auth requirement: {msg}"
         );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_semantics() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-toker"));
+        assert!(!constant_time_eq(b"short", b"longer-token"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     /// Runs store is bounded: oldest records are evicted past the cap.
