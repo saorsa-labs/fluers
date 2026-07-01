@@ -30,11 +30,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{from_fn_with_state, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse, Json,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router,
@@ -42,8 +43,10 @@ use axum::{
 use futures::stream::Stream;
 use futures::StreamExt;
 use std::convert::Infallible;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
 use fluers_core::{
@@ -52,13 +55,17 @@ use fluers_core::{
 };
 use fluers_protocol::{AgentInfo, InvokeRequest, InvokeResponse, RunRecord, RunStatus, SseEvent};
 use fluers_runtime::SessionRunner;
+use tokio_util::sync::CancellationToken;
 
-pub use state::{AgentHandle, ServerState};
+pub use state::{AgentHandle, ServerOptions, ServerState};
 
-/// Build the [`Router`] for the Fluers server, rooted at `/`.
+/// Build the base [`Router`] for the Fluers server, rooted at `/`.
 ///
-/// The caller is responsible for binding it to an address (see [`serve`]).
-pub fn router(state: Arc<ServerState>) -> Router {
+/// This is the *unauthenticated* local-dev router (no auth / CORS / body-limit
+/// layers). For a network-exposed deployment use [`router_with_options`], which
+/// layers auth + a request body limit + CORS. The caller binds it (see
+/// [`serve`] / [`serve_with_options`]).
+fn base_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/agents", get(list_agents))
@@ -68,7 +75,46 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
-/// Bind `router` to `addr` and serve until shutdown. Convenience entry point.
+/// Back-compat entry: build the unauthenticated local-dev router.
+pub fn router(state: Arc<ServerState>) -> Router {
+    base_router(state)
+}
+
+/// Build the full router stack: base routes, bearer auth, a request body
+/// limit, and CORS. `OPTIONS` preflight and `/health` bypass auth so CORS
+/// works and health probes succeed unauthenticated.
+///
+/// Used by [`serve_with_options`] for network-exposed deployments. All options
+/// (auth token, body limit, CORS origins) are read from [`ServerState::options`].
+fn router_with_options(state: Arc<ServerState>) -> Router {
+    let auth_state = state.clone();
+    // Clone the option values out so `state` can move into `base_router`.
+    let body_limit_bytes = state.options.body_limit_bytes;
+    let cors_origins = state.options.cors_origins.clone();
+    // CORS layer: explicit allow-list when configured, else permissive (local dev).
+    let cors = if cors_origins.is_empty() {
+        CorsLayer::permissive()
+    } else {
+        let origins: Vec<HeaderValue> = cors_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+    };
+    base_router(state)
+        // Body limit (innermost): bounds memory per request.
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        // Bearer-token auth.
+        .layer(from_fn_with_state(auth_state, bearer_auth))
+        // CORS (outermost): preflight is answered before auth runs.
+        .layer(cors)
+}
+
+/// Bind the base router to `addr` and serve until shutdown (local-dev
+/// convenience entry: no auth, no graceful-shutdown cleanup).
 ///
 /// # Errors
 /// Returns an error if the address cannot be bound.
@@ -76,12 +122,109 @@ pub async fn serve(addr: SocketAddr, state: Arc<ServerState>) -> anyhow::Result<
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;
-    let app = router(state);
+    let app = router_with_options(state.clone());
     tracing::info!("fluers dev server listening on http://{addr}");
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("server error: {e}"))?;
     Ok(())
+}
+
+/// Bind the full router stack to `addr` and serve with graceful shutdown.
+///
+/// **Security invariant:** a non-loopback bind *requires* an auth token — the
+/// registered agents carry the `exec` tool (`sh -c`), so exposing them without
+/// auth lets anyone who can reach the socket drive shell commands on the host.
+/// A non-loopback bind without [`ServerOptions::auth_token`] is rejected.
+///
+/// On shutdown (SIGTERM / Ctrl-C) every active run is cancelled and any
+/// `Running` records are flipped to `Failed` so they never freeze.
+///
+/// # Errors
+/// Returns an error if the address cannot be bound.
+pub async fn serve_with_options(addr: SocketAddr, state: Arc<ServerState>) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() && state.options.auth_token.is_none() {
+        return Err(anyhow::anyhow!(
+            "refusing to bind non-loopback {addr} without an auth token — the \
+             registered agents can run shell commands; pass --auth-token / \
+             FLUERS_SERVER_TOKEN, or bind 127.0.0.1"
+        ));
+    }
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}"))?;
+    let app = router_with_options(state.clone());
+    let auth = match listener.local_addr() {
+        Ok(a) => a,
+        Err(_) => addr,
+    };
+    tracing::info!("fluers server listening on http://{auth}");
+    let shutdown_state = state.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_state.cancel_active_runs();
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("server error: {e}"))?;
+    Ok(())
+}
+
+/// Bearer-token auth middleware. No token configured → allow (loopback dev).
+/// `/health` and CORS preflight (`OPTIONS`) bypass auth.
+async fn bearer_auth(
+    State(state): State<Arc<ServerState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    let expected = state.options.auth_token.as_deref();
+    // No token configured → open (loopback dev). `serve_with_options` forbids
+    // a non-loopback bind in this state.
+    let Some(expected) = expected else {
+        return Ok(next.run(req).await);
+    };
+    // CORS preflight and health probes bypass auth.
+    if req.method() == Method::OPTIONS || req.uri().path() == "/health" {
+        return Ok(next.run(req).await);
+    }
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if provided == expected {
+        Ok(next.run(req).await)
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token".to_string(),
+        ))
+    }
+}
+
+/// Wait for a shutdown signal (SIGTERM on Unix, Ctrl-C everywhere).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received; cancelling active runs and draining…");
 }
 
 /// `GET /health` — liveness probe.
@@ -140,7 +283,7 @@ async fn invoke(
     mark_run(&state, run_id, session_id, RunStatus::Running);
 
     let model = fluers_core::Model::new(&model_id);
-    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel = CancellationToken::new();
     let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
     // Build the request's tools: static list (legacy) or a fresh factory-built
     // list with a request-local `task` tool (config-UX). Either way, the tools
@@ -204,18 +347,31 @@ async fn stream(
 
     mark_run(&state, run_id, session_id, RunStatus::Running);
 
-    // Bridge: run the streaming loop on a task, forwarding events to a channel.
-    let (tx, rx) = mpsc::unbounded_channel::<SseEvent>();
+    // Bridge: run the streaming loop on a task, forwarding events to a
+    // **bounded** channel (back-pressure, not unbounded growth). The run's
+    // cancel token is tracked in `active_runs` (drained on graceful shutdown)
+    // and wrapped in `CancelOnDrop` so a client disconnect cancels the run —
+    // otherwise an abandoned connection would keep burning provider credit.
+    const SSE_CHANNEL_CAPACITY: usize = 256;
+    let (tx, rx) = mpsc::channel::<SseEvent>(SSE_CHANNEL_CAPACITY);
     let provider = handle.provider.clone();
     let config = handle.config.clone();
     let model = fluers_core::Model::new(&model_id);
     let state2 = state.clone();
-    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel = CancellationToken::new();
+    state.track_run(run_id, cancel.clone());
+    let cancel_for_guard = cancel.clone();
     // Tool building is deferred into the spawned task below so the request-local
     // event bus (and thus the request-local `task` tool) is owned by the task.
     let handle2 = handle.clone();
 
     tokio::spawn(async move {
+        // Ensure the run is untracked + its final status recorded whatever happens.
+        let state2 = state2.clone();
+        let _guard = RunGuard {
+            run_id,
+            state: state2.clone(),
+        };
         let event_bus = Arc::new(fluers_runtime::EventBus::new_default());
         let event_sink_arc: Arc<dyn fluers_core::EventSink> =
             event_bus.clone() as Arc<dyn fluers_core::EventSink>;
@@ -233,8 +389,9 @@ async fn stream(
                 // ToolCall / Done are consumed by the loop; not forwarded over SSE.
                 _ => return,
             };
-            // Best-effort forward; receiver drop just stops live updates.
-            let _ = tx.send(sse);
+            // Best-effort forward via try_send (non-blocking): a slow client
+            // simply drops live deltas rather than growing memory without limit.
+            let _ = tx.try_send(sse);
         };
         let result = run_agent_streaming(
             provider.as_ref(),
@@ -249,11 +406,13 @@ async fn stream(
         .await;
         match result {
             Ok(outcome) => {
-                let _ = tx.send(SseEvent::Done {
-                    run_id,
-                    session_id,
-                    turns: outcome.turns,
-                });
+                let _ = tx
+                    .send(SseEvent::Done {
+                        run_id,
+                        session_id,
+                        turns: outcome.turns,
+                    })
+                    .await;
                 let output = outcome.final_text;
                 let turns = outcome.turns;
                 let mut runs = state2.runs.write();
@@ -264,9 +423,11 @@ async fn stream(
                 }
             }
             Err(e) => {
-                let _ = tx.send(SseEvent::Error {
-                    message: e.to_string(),
-                });
+                let _ = tx
+                    .send(SseEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
                 let mut runs = state2.runs.write();
                 if let Some(r) = runs.get_mut(&run_id) {
                     r.status = RunStatus::Failed;
@@ -275,8 +436,11 @@ async fn stream(
         }
     });
 
-    // Map the SseEvent stream to axum SSE `Event`s.
-    let stream = UnboundedReceiverStream::new(rx).map(|ev| {
+    // Map the SseEvent stream to axum SSE `Event`s, wrapped in `CancelOnDrop`
+    // so that when the client disconnects (axum drops the response body stream)
+    // the run's cancel token fires and the spawned task aborts — closing the
+    // "abandoned connection burns provider credit" leak.
+    let mapped = ReceiverStream::new(rx).map(|ev| {
         let payload = ev.to_data_line().unwrap_or_else(|_| "{}".into());
         // Tag the event with its serde variant name so clients can switch on it.
         let kind = match &ev {
@@ -287,8 +451,49 @@ async fn stream(
         };
         Ok::<Event, Infallible>(Event::default().event(kind).data(payload))
     });
+    let guarded = CancelOnDropStream {
+        inner: mapped,
+        cancel: cancel_for_guard,
+    };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(guarded).keep_alive(KeepAlive::default()))
+}
+
+/// RAII guard that untracks a run when the streaming task finishes (normal or
+/// panic), so `active_runs` never retains a dead entry.
+struct RunGuard {
+    run_id: Uuid,
+    state: Arc<ServerState>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.state.untrack_run(self.run_id);
+    }
+}
+
+/// A stream wrapper that cancels a [`CancellationToken`] when dropped. axum
+/// drops the SSE response body stream on client disconnect, so wrapping the
+/// mapped event stream in this cancels the run the moment the client goes away.
+struct CancelOnDropStream<S> {
+    inner: S,
+    cancel: CancellationToken,
+}
+
+impl<S: Stream + Unpin> Stream for CancelOnDropStream<S> {
+    type Item = S::Item;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for CancelOnDropStream<S> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// Resolve a session: load an existing one (resume) or seed a new one.
@@ -355,10 +560,10 @@ async fn resolve_session(
     }
 }
 
-/// Record a run's initial state in the in-memory store.
+/// Record a run's initial state in the in-memory store (with bounded
+/// retention — oldest non-running records evicted past `max_run_records`).
 fn mark_run(state: &ServerState, run_id: Uuid, session_id: Uuid, status: RunStatus) {
-    let mut runs = state.runs.write();
-    runs.insert(
+    state.insert_run(
         run_id,
         RunRecord {
             run_id,
@@ -423,9 +628,18 @@ mod tests {
 
     /// Build a test `ServerState` with a single "echo" agent and a temp session dir.
     fn test_state() -> (Arc<ServerState>, tempfile::TempDir) {
+        test_state_with(None)
+    }
+
+    /// Build a test `ServerState` with an optional auth token (for auth tests).
+    fn test_state_with(auth_token: Option<String>) -> (Arc<ServerState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let adapter: Arc<dyn PersistenceAdapter> = Arc::new(JsonFileAdapter::new(dir.path()));
-        let state = Arc::new(ServerState::new(adapter));
+        let opts = ServerOptions {
+            auth_token,
+            ..ServerOptions::default()
+        };
+        let state = Arc::new(ServerState::new_with_options(adapter, opts));
         let handle = AgentHandle {
             provider: Arc::new(EchoStreamProvider {
                 chunks: vec!["hello".into(), " world".into()],
@@ -464,6 +678,117 @@ mod tests {
         let infos: Vec<AgentInfo> = serde_json::from_slice(&body).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "echo");
+    }
+
+    /// Auth: a request without a token is rejected when one is configured.
+    #[tokio::test]
+    async fn auth_rejects_request_without_token() {
+        let (state, _dir) = test_state_with(Some("s3cret".into()));
+        let app = router_with_options(state);
+        use tower::ServiceExt;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agents")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing token must be rejected when auth is configured"
+        );
+    }
+
+    /// Auth: a request with the correct bearer token is accepted.
+    #[tokio::test]
+    async fn auth_accepts_valid_bearer_token() {
+        let (state, _dir) = test_state_with(Some("s3cret".into()));
+        let app = router_with_options(state);
+        use tower::ServiceExt;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agents")
+                    .header("authorization", "Bearer s3cret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid bearer token must be accepted"
+        );
+    }
+
+    /// Auth: `/health` bypasses auth so liveness probes succeed unauthenticated.
+    #[tokio::test]
+    async fn health_bypasses_auth() {
+        let (state, _dir) = test_state_with(Some("s3cret".into()));
+        let app = router_with_options(state);
+        use tower::ServiceExt;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "health must bypass auth");
+    }
+
+    /// Security invariant: a non-loopback bind without an auth token is refused
+    /// (the agents carry `exec` → anyone reachable could drive shell commands).
+    #[tokio::test]
+    async fn serve_refuses_non_loopback_without_token() {
+        let (state, _dir) = test_state();
+        let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let res = serve_with_options(addr, state).await;
+        assert!(
+            res.is_err(),
+            "non-loopback bind without auth must be refused"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("auth token") || msg.contains("auth-token"),
+            "error should explain the auth requirement: {msg}"
+        );
+    }
+
+    /// Runs store is bounded: oldest records are evicted past the cap.
+    #[tokio::test]
+    async fn runs_are_evicted_past_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter: Arc<dyn PersistenceAdapter> = Arc::new(JsonFileAdapter::new(dir.path()));
+        let opts = ServerOptions {
+            max_run_records: 3,
+            ..ServerOptions::default()
+        };
+        let state = Arc::new(ServerState::new_with_options(adapter, opts));
+        for i in 0..5 {
+            let id = Uuid::new_v4();
+            state.insert_run(
+                id,
+                RunRecord {
+                    run_id: id,
+                    session_id: Uuid::new_v4(),
+                    status: RunStatus::Completed,
+                    output: format!("run {i}"),
+                    turns: 1,
+                },
+            );
+        }
+        assert_eq!(
+            state.runs.read().len(),
+            3,
+            "runs store must be capped at max_run_records"
+        );
     }
 
     #[tokio::test]

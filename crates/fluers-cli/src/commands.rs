@@ -172,6 +172,16 @@ pub(crate) struct DevArgs {
     /// Port to serve on.
     #[arg(long, default_value_t = 3000)]
     pub port: u16,
+    /// Host/interface to bind. Defaults to loopback (`127.0.0.1`) for safety —
+    /// the agents carry the `exec` tool. Binding a non-loopback interface
+    /// (e.g. `0.0.0.0`) REQUIRES `--auth-token` or the server refuses to start.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// Bearer token required on all routes except `/health` (and CORS
+    /// preflight). Falls back to `FLUERS_SERVER_TOKEN`. REQUIRED for a
+    /// non-loopback bind.
+    #[arg(long, env = "FLUERS_SERVER_TOKEN")]
+    pub auth_token: Option<String>,
     /// Provider backend (default `openrouter`).
     #[arg(long)]
     pub provider: Option<String>,
@@ -788,7 +798,14 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
             });
             Arc::new(fluers_runtime::JsonFileAdapter::new(sessions_dir))
         };
-    let state = Arc::new(fluers_server::ServerState::new(sessions));
+    let server_options = fluers_server::ServerOptions {
+        auth_token: args.auth_token.clone(),
+        ..fluers_server::ServerOptions::default()
+    };
+    let state = Arc::new(fluers_server::ServerState::new_with_options(
+        sessions,
+        server_options,
+    ));
 
     // Honor config-level budgets (max_turns / turn_timeout_ms / tool_concurrency)
     // so the served agents match `fluers run` semantics.
@@ -859,7 +876,11 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         registered_names.push("default".into());
     }
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
+    let host = args.host.clone();
+    let addr_str = format!("{host}:{}", args.port);
+    let addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --host/--port `{addr_str}`: {e}"))?;
     eprintln!("→ fluers dev server");
     if is_config_mode {
         eprintln!("  mode: config (`[agents.*]` resolved at startup; restart to reload)");
@@ -867,6 +888,13 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         eprintln!("  mode: legacy (built-in tools, no config agents)");
     }
     eprintln!("  note: single-user local dev — one shared workdir across requests");
+    if !addr.ip().is_loopback() {
+        if args.auth_token.is_some() {
+            eprintln!("  auth: bearer-token enabled (non-loopback bind)");
+        } else {
+            eprintln!("  warning: non-loopback bind without --auth-token will be refused");
+        }
+    }
     eprintln!("  endpoints:");
     eprintln!("    GET    /health");
     eprintln!("    GET    /agents");
@@ -875,7 +903,7 @@ pub(crate) async fn dev(args: DevArgs) -> anyhow::Result<()> {
         eprintln!("    POST   /agents/{name}/stream");
     }
     eprintln!("    GET    /runs/{{run_id}}");
-    fluers_server::serve(addr, state).await
+    fluers_server::serve_with_options(addr, state).await
 }
 
 /// `fluers build` — build a release binary, optionally a Docker image.
