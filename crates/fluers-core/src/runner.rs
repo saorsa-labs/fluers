@@ -388,14 +388,66 @@ struct StreamedTurn {
 /// `on_event` is invoked for every event (so callers can print deltas live);
 /// this function still returns the full reassembled turn so the loop can
 /// append the assistant message and execute tools.
+///
+/// `turn_timeout_ms` + `cancel` compose with each stream item await, mirroring
+/// [`invoke_with_budget`]: a provider that stalls mid-SSE (no event within
+/// the timeout) or a cancelled run both abort the turn rather than hang.
 async fn collect_streamed_turn(
     stream: crate::model::StreamEventStream,
     on_event: &mut (dyn FnMut(&StreamEvent) + Send),
+    turn_timeout_ms: Option<u64>,
+    cancel: &CancellationToken,
 ) -> Result<StreamedTurn> {
     use futures::StreamExt;
     let mut turn = StreamedTurn::default();
     let mut s = stream;
-    while let Some(item) = s.next().await {
+    loop {
+        // Fast-path cancellation check (mirrors `invoke_with_budget`).
+        if cancel.is_cancelled() {
+            return Err(CoreError::Cancelled("turn cancelled during stream".into()));
+        }
+        // Compose the per-item await with the turn timeout and the run's
+        // cancellation token. A provider that stalls mid-SSE would otherwise
+        // hang the session forever (the non-streaming path has this via
+        // `invoke_with_budget`; streaming must too — it's the server's primary
+        // mode).
+        let next = async { s.next().await };
+        let item = match turn_timeout_ms {
+            Some(ms) => {
+                let to = tokio::time::timeout(std::time::Duration::from_millis(ms), next);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(CoreError::Cancelled(
+                            "turn cancelled during stream".into(),
+                        ));
+                    }
+                    res = to => match res {
+                        Ok(Some(item)) => item,
+                        Ok(None) => break, // stream ended cleanly
+                        Err(_) => {
+                            return Err(CoreError::Cancelled(format!(
+                                "turn timed out after {ms}ms"
+                            )));
+                        }
+                    },
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(CoreError::Cancelled(
+                            "turn cancelled during stream".into(),
+                        ));
+                    }
+                    item = next => match item {
+                        Some(item) => item,
+                        None => break, // stream ended cleanly
+                    },
+                }
+            }
+        };
         match item {
             Ok(StreamEvent::TextDelta(t)) => {
                 on_event(&StreamEvent::TextDelta(t.clone()));
@@ -471,13 +523,14 @@ pub async fn run_agent_streaming(
         });
         // Stream the turn, reassembling into an assistant message + tool calls.
         let stream = provider.stream(request);
-        let turn = match collect_streamed_turn(stream, on_event).await {
-            Ok(t) => t,
-            Err(e) => {
-                hooks.emit_event(|sid| crate::event::run_failed(sid, e.to_string()));
-                return Err(e);
-            }
-        };
+        let turn =
+            match collect_streamed_turn(stream, on_event, config.turn_timeout_ms, cancel).await {
+                Ok(t) => t,
+                Err(e) => {
+                    hooks.emit_event(|sid| crate::event::run_failed(sid, e.to_string()));
+                    return Err(e);
+                }
+            };
         hooks.emit_event(|sid| RunEvent::ModelFinished {
             session: sid,
             turn: turns,
@@ -1404,6 +1457,96 @@ mod tests {
                 .unwrap_or(ModelResponse { messages: vec![] });
             Ok(next)
         }
+    }
+
+    /// A streaming provider that emits its first event only after `delay_ms`,
+    /// exercising the streaming-path timeout/cancellation (which the default
+    /// `stream` marker impl cannot).
+    struct SlowStreamingProvider {
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SlowStreamingProvider {
+        async fn invoke(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            // Unused by the streaming tests, but the trait requires it.
+            Ok(ModelResponse { messages: vec![] })
+        }
+        fn stream(&self, _request: ModelRequest) -> crate::model::StreamEventStream {
+            use futures::stream::StreamExt as _;
+            let delay = self.delay_ms;
+            Box::pin(
+                futures::stream::once(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    Ok(StreamEvent::TextDelta("finally".to_string()))
+                })
+                .chain(futures::stream::once(async { Ok(StreamEvent::Done) })),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_turn_times_out_on_slow_provider() {
+        // The provider's stream emits nothing for 500ms; the turn timeout is
+        // 100ms. The streaming path MUST abort (regression: previously it had
+        // no timeout and would hang until the stream produced).
+        let provider = SlowStreamingProvider { delay_ms: 500 };
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("hi")];
+        let config = RunConfig {
+            turn_timeout_ms: Some(100),
+            ..RunConfig::default()
+        };
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let mut on_event = |ev: &StreamEvent| {
+            events.push(ev.clone());
+        };
+        let result = run_agent_streaming(
+            &provider,
+            &[],
+            &mut messages,
+            &model,
+            &config,
+            &CancellationToken::new(),
+            &mut on_event,
+            &RunHooks::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled(_))),
+            "expected a streaming timeout cancellation, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_turn_aborts_on_cancel() {
+        // The provider's stream never emits; the run is cancelled mid-stream.
+        // The streaming path MUST observe the token and abort.
+        let provider = SlowStreamingProvider { delay_ms: 60_000 };
+        let model = Model::new("mock/test");
+        let mut messages = vec![user("hi")];
+        let cancel = CancellationToken::new();
+        let cancel_for_run = cancel.clone();
+        // Cancel shortly after the run starts.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_for_run.cancel();
+        });
+        let result = run_agent_streaming(
+            &provider,
+            &[],
+            &mut messages,
+            &model,
+            &RunConfig::default(),
+            &cancel,
+            &mut |_| {},
+            &RunHooks::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled(_))),
+            "expected cancellation to abort the streaming run, got {result:?}"
+        );
     }
 
     #[tokio::test]

@@ -393,13 +393,23 @@ impl SessionEnv for LocalSessionEnv {
     ) -> RuntimeResult<String> {
         // B-Swift Phase C1a / #4: fd-anchored open + read from the SAME fd
         // (closes the check-then-use TOCTOU the path-based read had).
+        //
+        // Bounded read (0.5.2): the output is capped at `max_bytes` anyway
+        // (apply_read_limits truncates beyond it), so reading the whole file
+        // first would OOM on a multi-GB file. Read at most `max_bytes` and
+        // trim any partial UTF-8 char at the cut. Memory is thus bounded by
+        // `max_bytes`, independent of the on-disk size.
         let (file, _size) = self.open_anchored_read(path)?;
-        let mut file = tokio::fs::File::from_std(file);
-        let mut raw = String::new();
-        file.read_to_string(&mut raw)
-            .await
-            .map_err(RuntimeError::Io)?;
-        Ok(apply_read_limits(raw, max_lines, max_bytes))
+        let (raw, truncated_at_cap) = read_bounded_string(file, max_bytes).await?;
+        let mut out = apply_read_limits(raw, max_lines, max_bytes);
+        // If the bounded read cut the file short (file > max_bytes) and
+        // apply_read_limits didn't itself add a truncation marker, surface that
+        // the content was capped — preserves the original oversized-file
+        // indicator that the unbounded read had.
+        if truncated_at_cap && !out.contains("[... truncated") {
+            out.push_str(&format!("\n[... truncated at {max_bytes} bytes ...]"));
+        }
+        Ok(out)
     }
 
     async fn read_file_full(&self, path: &Path, max_bytes: usize) -> RuntimeResult<String> {
@@ -579,7 +589,7 @@ impl SessionEnv for LocalSessionEnv {
         let search = validated.join(" ");
         // The process cwd is the root's inode path too (belt-and-suspenders);
         // `rg --no-follow` / the `find -P` fallback never follow symlinks.
-        let rg = std::process::Command::new("sh")
+        let rg = Command::new("sh")
             .arg("-c")
             .arg(format!(
                 "rg -n --no-follow -- {pat} {search} 2>/dev/null \
@@ -588,6 +598,7 @@ impl SessionEnv for LocalSessionEnv {
             ))
             .current_dir(&root_path)
             .output()
+            .await
             .map_err(RuntimeError::Io)?;
         let out = String::from_utf8_lossy(&rg.stdout);
         // Search paths are absolute inode paths (see above), so `rg`/`grep` emit
@@ -637,6 +648,56 @@ fn apply_read_limits(raw: String, max_lines: usize, max_bytes: usize) -> String 
         out
     } else {
         raw
+    }
+}
+
+/// Read at most `max_bytes` bytes from `file` into a `String`, trimming any
+/// partial UTF-8 char at the read boundary.
+///
+/// Bounds memory at `max_bytes` so a multi-GB file cannot OOM the truncating
+/// `read_file` path — the output is already capped at `max_bytes` by
+/// [`apply_read_limits`], so reading more than that is pure waste. If the
+/// `max_bytes` boundary splits a multibyte char, the partial trailing bytes are
+/// trimmed to the last valid char boundary. A genuinely invalid-UTF-8 file that
+/// fits within `max_bytes` still errors (mirrors the prior `read_to_string`).
+///
+/// Returns the decoded prefix and a flag set when the file was larger than
+/// `max_bytes` (i.e. the read hit the cap) so the caller can surface a
+/// truncation marker.
+async fn read_bounded_string(
+    file: std::fs::File,
+    max_bytes: usize,
+) -> RuntimeResult<(String, bool)> {
+    let file = tokio::fs::File::from_std(file);
+    let mut buf: Vec<u8> = Vec::with_capacity(max_bytes.min(8 * 1024));
+    file.take(max_bytes as u64)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(RuntimeError::Io)?;
+    // `read_full`: we read the whole file (didn't hit the cap) → any UTF-8
+    // error is genuine and should surface, not be silently trimmed.
+    let read_full = buf.len() < max_bytes;
+    let truncated_at_cap = !read_full;
+    match std::str::from_utf8(&buf) {
+        Ok(s) => Ok((s.to_string(), truncated_at_cap)),
+        Err(e) => {
+            let vu = e.valid_up_to();
+            if read_full {
+                Err(RuntimeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                )))
+            } else {
+                // Hit the cap: trim the truncated multibyte suffix. `vu` is, by
+                // definition, a valid char boundary, so `&buf[..vu]` is valid.
+                Ok((
+                    std::str::from_utf8(&buf[..vu])
+                        .map(str::to_string)
+                        .unwrap_or_default(),
+                    truncated_at_cap,
+                ))
+            }
+        }
     }
 }
 
@@ -895,6 +956,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, "deep content");
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_read_does_not_oom_on_large_file() {
+        // Regression for 0.5.2 bounded read: a file far larger than `max_bytes`
+        // must be read bounded (not fully buffered) and truncated, without
+        // erroring or OOMing. The old `read_to_string` of the whole file would
+        // allocate the entire multi-MB body.
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        // 100 KB of ASCII, capped at 64 bytes. Only the first ~64 bytes are
+        // returned (plus a truncation marker); nothing else is held in memory.
+        let body = "a".repeat(100 * 1024);
+        tokio::fs::write(dir.path().join("big.txt"), &body)
+            .await
+            .unwrap();
+        let got = env
+            .read_file(Path::new("big.txt"), 10_000, 64)
+            .await
+            .unwrap();
+        assert!(
+            got.contains("[... truncated at 64 bytes"),
+            "expected a byte-cap truncation marker: {got:?}"
+        );
+        assert!(got.len() < 128, "output must be bounded near max_bytes");
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_read_trims_multibyte_boundary() {
+        // A multibyte char straddling the `max_bytes` cut must be trimmed to a
+        // valid char boundary — no panic, no invalid UTF-8 in the output.
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        // Each `é` is 2 bytes (U+00E9, UTF-8 C3 A9). 10 of them = 20 bytes.
+        // Capping at 11 bytes splits the 6th char; the trim drops its trailing
+        // byte so the result is 5 chars (10 bytes).
+        let body = "é".repeat(10);
+        tokio::fs::write(dir.path().join("accent.txt"), body.as_bytes())
+            .await
+            .unwrap();
+        let got = env
+            .read_file(Path::new("accent.txt"), 10_000, 11)
+            .await
+            .unwrap();
+        // The bounded prefix must be valid UTF-8 and contain only whole chars.
+        assert!(
+            got.starts_with("ééééé"),
+            "trimmed prefix should be whole chars"
+        );
     }
 
     #[tokio::test]
