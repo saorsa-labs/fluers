@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::event::EventSink;
 use crate::model::{Model, ModelProvider};
+use crate::policy::ToolPolicy;
 use crate::runner::RunConfig;
 use crate::tool::Tool;
 
@@ -39,6 +40,10 @@ pub struct ToolRequestContext {
     pub cancel: CancellationToken,
     /// This run's event sink (OTel / tracing). Children emit to the same sink.
     pub event_sink: Option<Arc<dyn EventSink>>,
+    /// This run's optional tool policy (Fae deviation; see the README).
+    /// Children inherit it via the `TaskTool` so a governance gate cannot be
+    /// bypassed by delegating to a subagent. `None` ⇒ allow-all.
+    pub policy: Option<Arc<dyn ToolPolicy>>,
 }
 
 /// Builds the full tool list for a single request.

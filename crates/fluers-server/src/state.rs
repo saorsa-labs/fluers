@@ -57,6 +57,8 @@ impl AgentHandle {
                 parent_config: self.config.clone(),
                 cancel,
                 event_sink,
+                // The server wires no tool policy yet (allow-all).
+                policy: None,
             }),
             None => self.tools.clone(),
         }

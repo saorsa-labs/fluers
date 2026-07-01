@@ -26,6 +26,7 @@ use crate::error::{CoreError, Result as CoreResult};
 use crate::event::EventSink;
 use crate::message::{AgentMessage, ContentBlock, Role};
 use crate::model::{Model, ModelProvider};
+use crate::policy::ToolPolicy;
 use crate::runner::{run_agent, RunConfig, RunOutcome};
 use crate::tool::{InvokeContext, Tool, ToolDefinition, ToolResult};
 
@@ -177,6 +178,14 @@ pub struct TaskTool {
     /// Optional event sink (children emit to the same sink with a new session
     /// id, giving a nested trace without explicit span-parent linking).
     event_sink: Option<Arc<dyn EventSink>>,
+    /// Optional tool policy (Fae deviation; see the README). Held as an owned
+    /// `Arc` because a `TaskTool` is `'static` (lives in the tool list); it is
+    /// handed to each child run's [`RunHooks`] as a borrow via `as_deref()`, so
+    /// a governance gate applies to delegated subagents too — the policy cannot
+    /// be bypassed by delegating.
+    ///
+    /// [`RunHooks`]: crate::event::RunHooks
+    policy: Option<Arc<dyn ToolPolicy>>,
     /// Shared counter of **remaining** delegations across the whole tree.
     /// Bounds exponential fan-out: each successful `task` call decrements it.
     remaining_delegations: Arc<AtomicUsize>,
@@ -187,6 +196,10 @@ impl TaskTool {
     ///
     /// Include the returned tool in the parent agent's tool list to enable
     /// delegation to any of `subagents`.
+    // Each argument is a distinct per-run input (provider, model, config,
+    // subagents, options, cancel, event sink, policy); bundling them would only
+    // move the list into a struct without reducing what a caller must supply.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         provider: Arc<dyn ModelProvider>,
@@ -196,6 +209,7 @@ impl TaskTool {
         options: SubagentOptions,
         cancel: CancellationToken,
         event_sink: Option<Arc<dyn EventSink>>,
+        policy: Option<Arc<dyn ToolPolicy>>,
     ) -> Self {
         Self {
             provider,
@@ -206,6 +220,7 @@ impl TaskTool {
             depth: 0,
             cancel,
             event_sink,
+            policy,
             remaining_delegations: Arc::new(AtomicUsize::new(options.max_delegations)),
         }
     }
@@ -226,6 +241,8 @@ impl TaskTool {
             depth: self.depth + 1,
             cancel: self.cancel.clone(),
             event_sink: self.event_sink.as_ref().map(Arc::clone),
+            // The same policy governs every level of the tree.
+            policy: self.policy.as_ref().map(Arc::clone),
             // Shared across the whole tree.
             remaining_delegations: Arc::clone(&self.remaining_delegations),
         }
@@ -293,12 +310,14 @@ impl TaskTool {
         ];
 
         // Child hooks: new session id, no turn sink (the parent's persistence
-        // records the task tool result — exact replay), same event sink.
+        // records the task tool result — exact replay), same event sink, and
+        // the same tool policy (inherited so a governance gate applies to the
+        // delegated subagent too — it cannot be bypassed by delegating).
         let child_hooks = crate::event::RunHooks {
             session_id: Some(child_session),
             turn_sink: None,
             event_sink: self.event_sink.as_deref(),
-            policy: None,
+            policy: self.policy.as_deref(),
         };
 
         // Run the child to completion. Its events (SessionStarted → ... →
@@ -473,6 +492,7 @@ mod tests {
             },
             CancellationToken::new(),
             None,
+            None,
         )
     }
 
@@ -589,6 +609,7 @@ mod tests {
                 max_delegations: 1,
             },
             CancellationToken::new(),
+            None,
             None,
         );
         let ctx1 = InvokeContext {
@@ -736,6 +757,7 @@ mod tests {
             SubagentOptions::default(),
             cancel.clone(),
             None,
+            None,
         ));
         let tools: Vec<Arc<dyn Tool>> = vec![task];
         let mut messages = vec![
@@ -816,6 +838,7 @@ mod tests {
             },
             cancel.clone(),
             None,
+            None,
         ));
         let tools: Vec<Arc<dyn Tool>> = vec![task];
         let mut messages = vec![AgentMessage {
@@ -839,5 +862,134 @@ mod tests {
         // despite the grandchild depth-exceeded error (tool errors are
         // model-visible, not run-fatal).
         assert_eq!(outcome.turns, 2);
+    }
+
+    // ── Policy inheritance: a governance gate applies to subagents ───────
+
+    /// A tool that records whether it executed (to prove it did/did not run).
+    struct FlagTool {
+        name: String,
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for FlagTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                label: self.name.clone(),
+                description: "records execution".into(),
+                parameters: crate::tool::ParameterSchema {
+                    fields: std::collections::BTreeMap::new(),
+                },
+            }
+        }
+
+        async fn execute(&self, _ctx: InvokeContext, _input: Value) -> CoreResult<ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(ToolResult {
+                content: vec![serde_json::json!({ "type": "text", "text": "ran" })],
+                details: None,
+            })
+        }
+    }
+
+    /// A policy that denies exactly one tool by name; allows everything else.
+    struct DenyByName(String);
+
+    #[async_trait]
+    impl ToolPolicy for DenyByName {
+        async fn check(
+            &self,
+            tool: &str,
+            _input: &Value,
+            _ctx: &InvokeContext,
+        ) -> crate::policy::PolicyVerdict {
+            if tool == self.0 {
+                crate::policy::PolicyVerdict::Deny("blocked by test policy".into())
+            } else {
+                crate::policy::PolicyVerdict::Allow
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_applies_to_delegated_subagent() {
+        // A policy set on the TaskTool must govern the CHILD run too: a
+        // subagent must not be able to bypass the gate. The child owns a
+        // "danger" tool; the policy denies it. We assert the tool never
+        // executed, proving the policy was inherited by the delegated run.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let danger = Arc::new(FlagTool {
+            name: "danger".into(),
+            ran: Arc::clone(&ran),
+        });
+        let worker = SubagentProfile::new("worker", "you do work").with_tool(danger);
+
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::new(vec![
+            // Parent turn 1: delegate to the worker.
+            vec![parent_task_call("worker", "use the danger tool")],
+            // Child turn 1 (fresh session): call the denied tool.
+            vec![AgentMessage {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "cdanger".into(),
+                    call: crate::tool::ToolCall {
+                        name: "danger".into(),
+                        input: serde_json::json!({}),
+                    },
+                }],
+            }],
+            // Child turn 2: recover from the denial and report.
+            vec![assistant_text("could not run danger")],
+            // Parent turn 2: summarize.
+            vec![assistant_text("done")],
+        ]));
+
+        let cancel = CancellationToken::new();
+        let policy: Arc<dyn ToolPolicy> = Arc::new(DenyByName("danger".into()));
+        let task = Arc::new(TaskTool::new(
+            Arc::clone(&provider),
+            Model {
+                id: "test/m".into(),
+            },
+            RunConfig::default(),
+            vec![worker],
+            SubagentOptions::default(),
+            cancel.clone(),
+            None,
+            Some(Arc::clone(&policy)),
+        ));
+        let tools: Vec<Arc<dyn Tool>> = vec![task];
+        let mut messages = vec![AgentMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "delegate".into(),
+            }],
+        }];
+        // The parent run itself carries the same policy (borrowed).
+        let hooks = crate::event::RunHooks {
+            policy: Some(policy.as_ref()),
+            ..crate::event::RunHooks::default()
+        };
+        let outcome = run_agent(
+            provider.as_ref(),
+            &tools,
+            &mut messages,
+            &Model {
+                id: "test/m".into(),
+            },
+            &RunConfig::default(),
+            &cancel,
+            &hooks,
+        )
+        .await
+        .expect("parent run completes");
+
+        assert_eq!(outcome.final_text, "done");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "policy must block the subagent's tool — it was inherited, not bypassed"
+        );
     }
 }

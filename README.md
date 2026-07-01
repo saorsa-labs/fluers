@@ -99,7 +99,18 @@ shippable.
   unaffected. A `PolicyVerdict::Deny(reason)` skips execution and appends a
   model-visible error result (the loop continues, as with an unknown-tool
   result); `Confirm(reason)` is treated as allow-with-log by callers without a
-  confirmation channel. Upstream Flue has no equivalent per-tool gate.
+  confirmation channel. The policy is **inherited by delegated subagents** (the
+  built-in `task` tool threads it into every child run) so the gate cannot be
+  bypassed by delegating. Upstream Flue has no equivalent per-tool gate.
+
+  **Follow-ups (known gaps):**
+  - `Confirm` is currently **fail-open** in headless/one-shot runs: with no
+    confirmation channel it is downgraded to `Allow` (logged at `info`). For a
+    security-grade gate this should become a caller-selectable policy — a
+    fail-closed default (treat `Confirm` as `Deny` when no channel exists) is
+    the safer choice.
+  - No confirmation-channel abstraction exists yet; a real interactive host
+    needs a seam to surface `Confirm(reason)` to a user and await a decision.
 
 ## Attribution
 

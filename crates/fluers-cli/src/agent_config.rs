@@ -124,6 +124,7 @@ impl ResolvedAgentSpec {
                 self.options,
                 ctx.cancel,
                 ctx.event_sink,
+                ctx.policy,
             ));
             tools.insert(0, task);
         }
@@ -298,6 +299,8 @@ pub async fn resolve_agent(
         parent_config,
         cancel,
         event_sink,
+        // The CLI wires no tool policy yet (allow-all), mirroring RunHooks.
+        policy: None,
     });
     Ok(ResolvedAgent { tools })
 }
@@ -708,6 +711,7 @@ model = "minimax/minimax-m3"
             parent_config: fluers_core::RunConfig::default(),
             cancel: cancel(),
             event_sink: None,
+            policy: None,
         };
         let tools = spec.tools_for_run(ctx);
         assert_eq!(tools.len(), 2);
@@ -734,6 +738,7 @@ model = "minimax/minimax-m3"
                 parent_config: fluers_core::RunConfig::default(),
                 cancel: cancel(),
                 event_sink: None,
+                policy: None,
             })
         };
         let run_a = mk();
