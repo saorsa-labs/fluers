@@ -96,7 +96,7 @@ pub trait ModelProvider: Send + Sync {
     /// Run a turn, returning the full response.
     async fn invoke(&self, request: ModelRequest) -> Result<ModelResponse>;
 
-    /// Stream a turn as events. The default buffers [`invoke`]; providers
+    /// Stream a turn as events. The default buffers [`ModelProvider::invoke`]; providers
     /// with native streaming override this to emit deltas as they arrive.
     fn stream(&self, request: ModelRequest) -> StreamEventStream {
         // Default: run `invoke` on a blocking task and replay a single `Done`.

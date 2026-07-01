@@ -117,7 +117,7 @@ impl OpenAiCompatibleProvider {
         Ok(Self::new("https://api.minimaxi.com/v1", key))
     }
 
-    /// Like [`new`] but errors if the key is empty.
+    /// Like [`Self::new`] but errors if the key is empty.
     pub fn try_new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,

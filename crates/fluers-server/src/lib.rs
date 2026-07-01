@@ -15,7 +15,7 @@
 //! | POST   | `/agents/:name/stream`     | Run an agent, stream SSE events.     |
 //! | GET    | `/runs/:run_id`            | Fetch a run record.                  |
 //!
-//! Sessions are persisted via a [`PersistenceAdapter`]: pass a `session_id` in
+//! Sessions are persisted via a [`fluers_runtime::PersistenceAdapter`]: pass a `session_id` in
 //! [`InvokeRequest`] to resume, omit it to start a new session (the id is
 //! echoed in the response).
 

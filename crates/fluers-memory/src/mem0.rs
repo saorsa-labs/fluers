@@ -33,8 +33,7 @@ pub const DEFAULT_HOST: &str = "https://api.mem0.ai";
 
 /// A hosted-platform mem0 REST adapter.
 ///
-/// Construct with [`Mem0RestAdapter::new`] (or [`Mem0RestAdapter::builder`] for
-/// explicit options). The adapter holds a pooled [`reqwest::Client`]; it is
+/// Construct with [`Mem0RestAdapter::new`]. The adapter holds a pooled `reqwest::Client`; it is
 /// cheaply cloneable and safe to share across tasks.
 #[derive(Clone)]
 pub struct Mem0RestAdapter {

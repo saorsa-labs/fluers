@@ -75,7 +75,7 @@ pub struct AgentHandle {
 impl AgentHandle {
     /// Build the tool list for a single request.
     ///
-    /// If a [`ToolFactory`] is set, it is called with a [`ToolRequestContext`]
+    /// If a [`ToolFactory`] is set, it is called with a [`fluers_core::ToolRequestContext`]
     /// carrying this handle's provider/model/config plus the per-request
     /// `cancel` + `event_sink` — so any `task` tool it builds is correctly
     /// scoped to this run. Otherwise the static [`tools`](AgentHandle::tools)

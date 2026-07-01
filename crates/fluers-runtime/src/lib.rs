@@ -6,7 +6,7 @@
 //!
 //! - [`agent`] — `define_agent` / `AgentProfile` (model + tools + skills +
 //!   sandbox + instructions), mirroring `@flue/runtime`'s `defineAgent`.
-//! - [`env`] — the [`SessionEnv`](env::SessionEnv) trait: the filesystem +
+//! - `env` — the `SessionEnv` trait: the filesystem +
 //!   process abstraction that every sandbox backend implements.
 //! - [`sandbox`] — virtual / local / remote sandbox backends.
 //! - [`session`] — session management, event store, dispatch/invoke.

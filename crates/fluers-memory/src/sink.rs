@@ -4,7 +4,7 @@
 //!   turn and contributes it to a [`MemoryAdapter`]. **Fail-open**: mem0 errors
 //!   are logged and swallowed, so a memory outage can never break session
 //!   persistence or the agent run.
-//! - [`FanoutMemorySink`] — convenience builder that composes an existing
+//! - [`fanout_with_memory`] — convenience builder that composes an existing
 //!   persistence sink (e.g. `SessionRunner`) with a [`MemoryTurnSink`] behind a
 //!   [`fluers_core::FanoutTurnSink`].
 

@@ -43,7 +43,7 @@ pub trait SessionEnv: Send + Sync {
     /// writes the file back): the bounded [`read_file`](Self::read_file) silently
     /// truncates large files and would cause data loss on write-back. This method
     /// checks the file size (via metadata, before reading) and returns
-    /// [`RuntimeError::FileTooLarge`] if the file is too big, so the caller never
+    /// [`crate::error::RuntimeError::FileTooLarge`] if the file is too big, so the caller never
     /// operates on partial data. Path containment is enforced as for `read_file`.
     async fn read_file_full(&self, path: &Path, max_bytes: usize) -> RuntimeResult<String>;
 
@@ -91,7 +91,7 @@ pub struct Limits {
     /// Max line length before truncation.
     pub max_grep_line_length: usize,
     /// Max file size (bytes) for a non-truncating `edit` read. Files larger
-    /// than this are rejected with [`RuntimeError::FileTooLarge`] rather than
+    /// than this are rejected with [`crate::error::RuntimeError::FileTooLarge`] rather than
     /// edited (which would risk data loss from a truncated read).
     pub max_edit_bytes: usize,
 }

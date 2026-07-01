@@ -1,6 +1,6 @@
 //! Sandbox backends.
 //!
-//! A [`Sandbox`] manufactures a fresh [`SessionEnv`](crate::SessionEnv) for a
+//! A [`Sandbox`] manufactures a fresh `SessionEnv` for a
 //! session. Flue ships three flavours — *virtual*, *local*, and *remote
 //! container* — selected via `local()` / container providers. This crate
 //! implements the local flavour (see [`LocalSessionEnv`]); virtual + remote

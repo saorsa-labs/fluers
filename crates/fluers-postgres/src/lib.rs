@@ -26,7 +26,7 @@
 //!
 //! ## Compile-time requirements
 //!
-//! Uses runtime SQL ([`sqlx::query`]) — **not** the `query!` macro — so the
+//! Uses runtime SQL (`sqlx::query`) — **not** the `query!` macro — so the
 //! crate compiles without a `DATABASE_URL` or `cargo sqlx prepare` step.
 //!
 //! ## Testing

@@ -2,7 +2,7 @@
 //!
 //! Semantic long-term memory for Fluers agents, backed by [mem0].
 //!
-//! This is a **complement** to [`fluers_runtime::PersistenceAdapter`] (MVP 4a),
+//! This is a **complement** to the `PersistenceAdapter` (MVP 4a),
 //! not a replacement. `PersistenceAdapter` stores exact session state for
 //! faithful resume-after-kill; this crate stores *semantic* facts extracted from
 //! conversations (user preferences, durable context) so an agent can recall a
@@ -16,7 +16,7 @@
 //! - [`format_memories`] — deterministic formatting for system-prompt injection.
 //! - [`Mem0RestAdapter`] — the hosted-platform mem0 REST adapter
 //!   (see [`mem0`]).
-//! - [`MemoryTurnSink`] / [`FanoutTurnSink`] wiring — see [`sink`].
+//! - [`MemoryTurnSink`] / `FanoutTurnSink` wiring — see [`sink`].
 //!
 //! See `docs/MVP4_MEMORY_DESIGN.md` for the full design, wire contract, and
 //! sources.

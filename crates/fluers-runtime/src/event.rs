@@ -4,7 +4,7 @@
 //! Observers subscribe to a stream of [`Event`]s (= [`fluers_core::RunEvent`])
 //! emitted as a session runs.
 //!
-//! The [`Event`] type and the [`EventSink`](fluers_core::EventSink) trait live
+//! The [`Event`] type and the [`EventSink`] trait live
 //! in `fluers-core` so that `run_agent` (which lives in core) can emit events
 //! without creating a `core → runtime` dependency cycle. [`EventBus`] implements
 //! that trait here.

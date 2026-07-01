@@ -57,11 +57,26 @@ pub const MCP_MAX_RESULT_CHARS: usize = 256 * 1024;
 /// otherwise). No legitimate server advertises anywhere near this many.
 pub const MCP_MAX_TOOLS_PER_SERVER: usize = 256;
 
+/// Slice `s` to at most `max_bytes` bytes, never splitting a multibyte UTF-8
+/// char: walk back from `max` to the nearest char boundary. Used wherever we
+/// bound user/server content by byte length (the raw `&s[..n]` panics if `n`
+/// lands inside a multibyte char — e.g. non-ASCII tool output at the cap).
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Truncate a string to [`MCP_ERROR_SUMMARY_MAX_CHARS`], appending an ellipsis.
 fn bound_error(msg: impl AsRef<str>) -> String {
     let s = msg.as_ref();
     if s.len() > MCP_ERROR_SUMMARY_MAX_CHARS {
-        format!("{}…(truncated)", &s[..MCP_ERROR_SUMMARY_MAX_CHARS])
+        format!(
+            "{}…(truncated)",
+            truncate_at_char_boundary(s, MCP_ERROR_SUMMARY_MAX_CHARS)
+        )
     } else {
         s.to_string()
     }
@@ -80,7 +95,7 @@ pub enum McpError {
     /// A `tools/call` did not finish within the per-request timeout.
     #[error("mcp tool call timed out after {0:?}")]
     Timeout(Duration),
-    /// The tool call was cancelled via the run's [`tokio_util::sync::CancellationToken`].
+    /// The tool call was cancelled via the run's `CancellationToken`.
     #[error("mcp tool call cancelled")]
     Cancelled,
 }
@@ -243,7 +258,7 @@ pub fn format_mcp_result(result: &CallToolResult) -> String {
     if joined.len() > MCP_MAX_RESULT_CHARS {
         joined = format!(
             "{}…(result truncated at {} chars)",
-            &joined[..MCP_MAX_RESULT_CHARS],
+            truncate_at_char_boundary(&joined, MCP_MAX_RESULT_CHARS),
             MCP_MAX_RESULT_CHARS
         );
     }
@@ -536,6 +551,34 @@ mod tests {
             &long[..MCP_ERROR_SUMMARY_MAX_CHARS],
             &"x".repeat(MCP_ERROR_SUMMARY_MAX_CHARS)
         );
+    }
+
+    #[test]
+    fn truncation_never_splits_multibyte_char() {
+        // Regression for the UTF-8 byte-slice panic: `&s[..N]` panicked when N
+        // landed inside a multibyte char. Non-ASCII content at the cap must
+        // truncate to the nearest char boundary without panicking.
+        // Each `é` is 2 bytes; a 202-byte string has a multibyte char straddling
+        // the 200-byte cap. `bound_error` must not panic and must return valid
+        // UTF-8 ending at a char boundary.
+        let body = "é".repeat(101); // 202 bytes
+        let bounded = bound_error(body);
+        assert!(bounded.ends_with("…(truncated)"));
+        // The prefix before the marker must be valid UTF-8 and whole chars.
+        let prefix = bounded.trim_end_matches("…(truncated)");
+        assert!(std::str::from_utf8(prefix.as_bytes()).is_ok());
+        // 200 bytes / 2 bytes per char = 100 chars (no partial char).
+        assert_eq!(prefix.chars().count(), 100);
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_helper_is_safe() {
+        assert_eq!(truncate_at_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_at_char_boundary("abc", 2), "ab");
+        // `é` = C3 A9 (2 bytes). Cutting at byte 1 would split it → walk to 0.
+        assert_eq!(truncate_at_char_boundary("é", 1), "");
+        // Two `é` (4 bytes); cut at 3 → walk to byte 2 (one whole char).
+        assert_eq!(truncate_at_char_boundary("éé", 3), "é");
     }
 
     #[test]

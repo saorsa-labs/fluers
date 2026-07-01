@@ -75,7 +75,7 @@ pub type AgentConfigResult<T> = std::result::Result<T, AgentConfigError>;
 /// The static resolution of a config-declared agent: everything that can be
 /// built once (at startup or run start) and reused. The per-request
 /// `task` tool is **not** here — it is built by [`tools_for_run`] from a
-/// [`ToolRequestContext`] so cancellation / events / delegation budget stay
+/// [`fluers_core::ToolRequestContext`] so cancellation / events / delegation budget stay
 /// scoped to a single run.
 ///
 /// [`tools_for_run`]: ResolvedAgentSpec::tools_for_run
@@ -210,7 +210,7 @@ impl McpCache {
 /// Resolve the selected agent into a [`ResolvedAgentSpec`] (static: MCP
 /// connections, subagent graph, built-ins). Does **not** build the `task`
 /// tool — call [`ResolvedAgentSpec::tools_for_run`] with a per-run
-/// [`ToolRequestContext`] to get the full tool list.
+/// [`fluers_core::ToolRequestContext`] to get the full tool list.
 ///
 /// `builtin_tools` is the standard read/write/bash/glob/grep set, included
 /// when the agent opts into `builtin_tools` (top-level default `true`).

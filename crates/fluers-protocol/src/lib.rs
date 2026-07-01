@@ -71,7 +71,7 @@ pub struct RunRecord {
 
 /// A single Server-Sent Event emitted by `POST /agents/:name/stream`.
 ///
-/// Mirrors the in-process [`fluers_core::StreamEvent`] but adds terminal
+/// Mirrors the in-process `StreamEvent` but adds terminal
 /// `Done`/`Error` variants carrying run/session bookkeeping, and is
 /// serde-tagged for the SSE `data:` line.
 #[derive(Debug, Clone, Serialize, Deserialize)]

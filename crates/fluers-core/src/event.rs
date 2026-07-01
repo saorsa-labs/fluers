@@ -53,7 +53,7 @@ pub enum RunEvent {
         turn: usize,
         /// The tool name.
         tool: String,
-        /// The tool call id (correlates with [`ToolFinished`]).
+        /// The tool call id (correlates with [`RunEvent::ToolFinished`]).
         call_id: String,
     },
     /// A tool call completed.
@@ -64,7 +64,7 @@ pub enum RunEvent {
         turn: usize,
         /// The tool name.
         tool: String,
-        /// The tool call id (correlates with [`ToolStarted`]).
+        /// The tool call id (correlates with [`RunEvent::ToolStarted`]).
         call_id: String,
         /// Whether the tool succeeded.
         ok: bool,
@@ -136,7 +136,7 @@ impl EventSink for NullEventSink {
 /// [`crate::runner::run_agent_streaming`].
 ///
 /// Bundles the session id (for event correlation), the optional per-turn
-/// [`TurnSink`] (for persistence), and the optional [`EventSink`] (for
+/// [`crate::TurnSink`] (for persistence), and the optional [`crate::EventSink`] (for
 /// observability). Replacing the old `on_turn: Option<&dyn TurnSink>` parameter
 /// with `&RunHooks` keeps the function signature stable while leaving room for
 /// future hooks without API churn.
