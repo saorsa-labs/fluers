@@ -463,17 +463,20 @@ impl SessionEnv for LocalSessionEnv {
         let cwd_fd = self.open_anchored_dir(cwd)?;
         let cwd_path = Self::fd_real_path(cwd_fd.as_fd())?;
 
-        let mut child = Command::new("sh")
+        // `kill_on_drop(true)`: on timeout/cancel the in-flight `wait_with_output`
+        // future (which owns the child) is dropped, and its `Drop` sends SIGKILL —
+        // so a still-running child is never orphaned.
+        let child = Command::new("sh")
             .arg("-c")
             .arg(command)
             .current_dir(&cwd_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(RuntimeError::Io)?;
         // `cwd_fd` stays live until end of scope (spawn has run by now).
 
-        let timeout_ms_value = timeout_ms;
         let timeout_fut = match timeout_ms {
             Some(ms) => Box::pin(tokio::time::sleep(std::time::Duration::from_millis(ms)))
                 as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
@@ -481,25 +484,28 @@ impl SessionEnv for LocalSessionEnv {
         };
         let cancel_fut = cancel.cancelled();
 
+        // `wait_with_output` drains stdout AND stderr concurrently while it waits.
+        // The old `child.wait()` did not read the pipes, so a child emitting more
+        // than the OS pipe buffer (~64 KB) blocked on a full pipe while `wait()`
+        // blocked on the child — a deadlock that only broke on timeout (output
+        // lost, misreported as a 124), or hung forever with no timeout set.
         tokio::select! {
             _ = timeout_fut => {
-                // Timeout: try to kill, then return the 124-shaped result.
-                let _ = child.kill().await;
-                return Ok(ShellResult {
+                // `child` (moved into the dropped `wait_with_output` future) is
+                // SIGKILLed via `kill_on_drop`. Return the 124-shaped result.
+                Ok(ShellResult {
                     exit_code: 124,
                     stdout: String::new(),
-                    stderr: format!("command timed out after {}ms", timeout_ms_value.unwrap_or(0)),
-                });
+                    stderr: format!("command timed out after {}ms", timeout_ms.unwrap_or(0)),
+                })
             }
             _ = cancel_fut => {
-                let _ = child.kill().await;
-                return Err(RuntimeError::Sandbox("command cancelled".into()));
+                Err(RuntimeError::Sandbox("command cancelled".into()))
             }
-            status = child.wait() => {
-                let status = status.map_err(RuntimeError::Io)?;
-                let output = child.wait_with_output().await.map_err(RuntimeError::Io)?;
+            output = child.wait_with_output() => {
+                let output = output.map_err(RuntimeError::Io)?;
                 Ok(ShellResult {
-                    exit_code: status.code().unwrap_or(-1),
+                    exit_code: output.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 })
@@ -1270,6 +1276,34 @@ mod tests {
             )
             .await;
         assert!(res.is_err(), "a symlinked cwd must be rejected");
+    }
+
+    #[tokio::test]
+    async fn exec_large_stdout_does_not_deadlock() {
+        // Regression: `exec` used to `child.wait()` WITHOUT draining the stdout
+        // pipe, so a child emitting more than the OS pipe buffer (~64 KB) blocked
+        // on a full pipe while `wait()` blocked on the child — a deadlock. With no
+        // timeout set (as here) the old code hung forever; `wait_with_output` now
+        // drains both pipes concurrently, so the full output returns intact.
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalSessionEnv::new(dir.path(), Limits::default())
+            .await
+            .unwrap();
+        let res = env
+            .exec(
+                "yes a | head -c 200000",
+                Path::new("."),
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(
+            res.stdout.len(),
+            200_000,
+            "full >64 KB stdout must survive without deadlock"
+        );
     }
 
     #[tokio::test]
